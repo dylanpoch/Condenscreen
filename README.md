@@ -2,10 +2,8 @@
 
 ## High-Throughput Image Analysis and Statistical Pipeline for Quantifying Condensates
 
-**CondenScreen** is a robust, open-source pipeline developed to analyze condensate phenotypes in immunofluorescence images. Developed by the Schlieker Lab, the program leverages [CellProfiler 4.2.8](https://cellprofiler.org/) for image segmentation and R for statistical analysis. 
+**CondenScreen** is a robust, open-source pipeline developed to analyze condensate phenotypes in immunofluorescence images. Developed by the Schlieker Lab, the program leverages [CellProfiler 4.2.6](https://cellprofiler.org/) for image segmentation and R for statistical analysis. 
 
-#### For the condensate trained deep residual convolutional neural network (ResNet18) model, please download .ipynb file in CondensateML along with its associated model.pt file.
-#### For Interactive Figures, please download the .html files in the InteractiveFigures folder!
 ---
 
 ## Overview
@@ -29,7 +27,7 @@ Originally developed to analyze MLF2-GFP foci, the pipeline can be adapted for o
 
 - [Download R](https://cran.r-project.org/)
 - [Download RStudio](https://posit.co/download/rstudio-desktop/)
-- [Download CellProfiler 4.2.8](https://cellprofiler.org/)
+- [Download CellProfiler 4.2.6+](https://cellprofiler.org/)
 
 ---
 
