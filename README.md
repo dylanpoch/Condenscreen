@@ -4,8 +4,8 @@
 
 **CondenScreen** is a robust, open-source pipeline developed to analyze condensate phenotypes in immunofluorescence images. Developed by the Schlieker Lab, the program leverages [CellProfiler 4.2.8](https://cellprofiler.org/) for image segmentation and R for statistical analysis. 
 
-### For our trained deep residual convolutional neural network (ResNet18) model, please download .ipynb file in CondensateML along with its associated model.pt file.
-### For Interactive Figures, please download the .html files in the InteractiveFigures folder!
+#### For the condensate trained deep residual convolutional neural network (ResNet18) model, please download .ipynb file in CondensateML along with its associated model.pt file.
+#### For Interactive Figures, please download the .html files in the InteractiveFigures folder!
 ---
 
 ## Overview
