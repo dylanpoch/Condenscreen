@@ -15,107 +15,11 @@ This repository includes:
 - A **CellProfiler pipeline** to quantify & segment condensate foci/puncta into single cells
 - A **Bash script** to batch-process image sets across a computing cluster (in this case Yale's YCRC)
 - An **R script** for statistical analysis of foci, cell count, and screen-wide normalization using Z-, B-, and BZ-scores, depending on indication.
+- A trained supervised machine learning approach to characterize distinct condensate phenotypes from microscopy data
 - A Graphical User Interface allowing well-selection and automated code alterations depending on if screen had a signal-ON vs signal-OFF readout.
 - Tools for hit identification & automated data visualization output.
 
 Originally developed to analyze MLF2-GFP foci, the pipeline can be adapted for other foci types and imaging setups.
-
----
-
-## CellProfiler Image Segmentation Pipeline
-
-We designed a custom image segmentation workflow in CellProfiler 4.2.8:
-
-- **Nuclei Detection**
-  - Identified using shape constraints (30–100 pixels)
-  - Segmented via *adaptive Minimum Cross-Entropy thresholding* (0.1–1.0)
-
-- **Cytoplasm & Condensate Foci Detection**
-  - Enhance foci features to limit background.
-  - Foci identified using  *adaptive Otsu thresholding* (0.0175–1.0; 1-10 pixel size)
-  - Foci assigned to individual cells via cytoplasm/nuclei mapping
-    
-- **Quantification of Intensity, Size, & FormFactor**
-  - Nuclei (and optionally foci) have their intensity, size, and formfactor, among many additional variables quantified.
-  - All foci data are grouped according to parent cell
-  - Data and annotated images exported
-    
-### Cluster Deployment (Optional)
-
-For large-scale screens, we developed a simple batch script for high-throughput processing using SLURM and headless CellProfiler runs:
-
-1. Generate batch files using CellProfiler’s `CreateBatchFiles` module
-2. Submit jobs using provided `.sh` script
-3. Analyze >1 million `.TIFF` images autonomously within hours (dependent on cluster capabilities)
-
----
-
-## R-Based Statistical Analysis (CondenScreen)
-
-The **CondenScreen** R pipeline includes:
-
-- **Plate Parsing**
-  - Graphical user interface to assign controls vs test conditions across plates ranging from 6-well --> 384-well.
-  - Groups image sets by well using filename string parsing
-
-- **Quantification Metrics**
-  - Imports CellProfiler CSV files batching into sets of 20 files/run to limit slow-down
-  - Extracts foci/cell and nuclear statistics reported from CellProfiler
-  - Nuclei count per image and aggregate count per condition
-  - Signal-to-background (SB)
-  - Standard deviation (SD)
-  - Coefficient of variation (CV)
-  - **Z’ score**:
-    ```
-    Z' = 1 - [3(σ_PosCtrl + σ_NegCtrl) / |μ_PosCtrl - μ_NegCtrl|]
-    ```
-
-- **Effect and Significance Calculation**
-  - **Percent effect (E%)**:
-    ```
-    E% = ((x̄ - μ) / μ) * 100
-    ```
-  - **Z-score**:
-    ```
-    Z = (E% - μ_E%) / σ_E%
-    ```
-  - **B-score normalization** (optional):
-    - Applies 2-way median polish for intraplate normalization
-    - Uses MAD-based normalization:
-    ```
-    MAD = median(r - median(R))
-    ```
-  - **Nuclear Health Score**:
-    -Applies function to assess deviations in nuclear health relative to control cells
-    -Takes into account total number of cells, nuclear area, and morphological changes (form factor)
-    ``` 
-    Nuclear Health = ∆(Cell Count) + ((100 + ∆(Cell Count)) / 100) ∙ ∑〖(∆Area+ ∆FF)) / 2〗
-    ```
-
-  
-    
-- **Output Includes**
-  - Ranked hit lists 
-  - Raw and normalized screening distributions
-  - Plate heatmaps
-  - Z-score/BZ-score plots
-    
-
-- **Quality Control**
-  - Optionally filters bottom 80% of low-expressing cells to limit either uninduced or non-transfected cells
-  - Removes outlier image sets with screening artifacts.
- 
- 
-
----
-## Repository Contents
-
-```
-CPBatch.sh               # Bash script to run CellProfiler on a SLURM cluster
-CondenScreen.Rmd         # Main R markdown script for data analysis and hit calling
-CondenScreen_CP.cpproj   # RStudio project file
-process_batch.R          # Helper script required by CondenScreen.Rmd
-```
 
 ---
 
@@ -141,95 +45,112 @@ git clone https://github.com/your-username/CondenScreen.git
 
 ---
 
-### 3. Run the CellProfiler Project
+## CellProfiler Image Segmentation Pipeline
 
-- Launch CellProfiler and load the included `.cpproj` file
-- Upload your image set:
-  - Images are expected to be grouped in sets of 3 channels (DAPI, GFP, RFP)
-  - Adjust this as needed based on your imaging setup
-  - ***The downstream R script is programmed to analyze images that are labeled in a format similar to: A19942_B01_s1_w1, where:***
-      - The first string segment (A19942) correlates to the plate ID
-      - The second segment (B01) correlates to Well Location
-      - The third segment (s1) correlates to Image Number within that well
-      - The fourth segment (w1) correlates to the Channel of the image.
-    - If your labeling pattern is different, you may need to adjust string parsing within R code block #4.
-       
-- Customize foci identification parameters to suit your experiment
-- Test pipeline on sample images and confirm segmentation accuracy
-- Update the output/export folder path
-- Run the pipeline on all images
+We designed a custom image segmentation workflow in CellProfiler 4.2.8:
 
----
+- **Nuclei Detection**
+  - Identified using shape constraints (30–100 pixels)
+  - Segmented via *adaptive Minimum Cross-Entropy thresholding* (0.1–1.0)
 
-### 4. Analyze Results in R
-
-- Open `CondenScreen.Rmd` in RStudio
-- Ensure `process_batch.R` is located in the same folder
-
-#### First-Time Setup:
-- Uncomment lines 13–37 to install required R packages
-- Run the **first code block** to load dependencies
-
-#### GUI & Data Input:
-- Run the **second code block** to launch a GUI
-  - Assign well conditions
-  - Indicate whether your screen is signal-ON or signal-OFF
-  - Choose output directories
-
-#### Save Location & Optional Metadata:
-- Update the `save_Location` variable in the **third code block**
-- (Optional) If you have metadata linking drug/gene names to well IDs:
-  - Update the **fourth code block**
-   
----
-
-### 5. Run the Full Analysis
-
-- Run all code blocks in the R Markdown file
-- Output will include:
-  - Excel file with rank-ordered hit list
-  - Plate overview sheet with Z’-scores, S/B ratios, etc.
-  - Per-plate control summaries
-
-- Additional outputs:
-  - Z-score and BZ-score plots
-  - Raw foci count distributions
-  - Normalized effect distributions
-  - A new folder with per-plate heatmaps for visualization
-
----
+- **Cytoplasm & Condensate Foci Detection**
+  - Enhance foci features to limit background.
+  - Foci identified using  *adaptive Otsu thresholding* (0.0175–1.0; 1-10 pixel size)
+  - Foci assigned to individual cells via cytoplasm/nuclei mapping
+    
+- **Quantification of Intensity, Size, & FormFactor**
+  - Nuclei (and optionally foci) have their intensity, size, and formfactor, among many additional variables quantified.
+  - All foci data are grouped according to parent cell
+  - Data and annotated images exported
 
 
----
 
-### [Optional] Instructions for Running CellProfiler on a Cluster
+- License: Apache License Version 2.0 (January 2004)
+- Tested platforms: macOS (Apple M2, macOS 15.5) and Windows 10 (desktop with AMD Ryzen 7 2700X and GeForce RTX 2070)
+- No required non-standard hardware
+- The project is open-source under the Apache 2.0 license.
 
-If processing a large image dataset:
-- Upload CPBatch.sh & CondenScreen_CP.cpproj to a new folder within your HPC cluster system
-- Customize `CPBatch.sh`:
-  - Set correct number of plates and image sets (default: 3024 image sets across 10 plates)
-  - Update file paths to match your environment
-  - Upload this updated CPBatch.sh file into your newly created folder
-- This next part depends on your specific cluster setup. You may need to request access to use CellProfiler on the cluster.
-    -Once cellprofiler is installed, activate it and load in pipeline.
-    -In our case, once in the correct directory, we used: module load miniconda; conda activate cp4; cellprofiler
-- Import raw images to cellprofiler + update paths as required.
-- Check "CreateBatchFiles"
-- Click "Analyze Images". After a few minutes should get a similar output: "CreateBatchFiles saved pipeline to /home/user_specific/Batch_data.h5
-- From command line linked to cluster, navigate to the path where both CPBatch.sh and Batch_data.h5 are located. Run the following command:
+System requirements
+-------------------
+1. Software dependencies and operating systems
+   - A modern web browser (latest stable versions of Chrome, Firefox, Edge, or Safari).
+   - Access to Python 3.1+ (access to interactive python environment [e.g., Jupyter Notebook] recommended) and R 4.3+ [RStudio recommended].
 
-```bash
-sbatch CPBatch.sh
-```
+2. Versions the software has been tested on
+   - macOS 15.5 (Ventura / Sonoma — tested on a MacBook Air, Apple M2, 16 GB)
+   - Windows 10 (desktop, AMD Ryzen 7 2700X, 64 GB RAM, NVIDIA GeForce RTX 2070)
 
-- (optional) Monitor job queue with:
-```bash
-squeue -u <your_username>
-```
+3. Non-standard hardware
+   - None required. The software is designed to run on standard desktop/laptop hardware and in a modern web browser. GPU access recommended.
 
-- Download the analyzed output files and continue to Step #4.
+Installation guide
+------------------
+A. Open locally 
+1. Clone the repository:
+   - git clone https://github.com/SchliekerLab/Condenscreen-v1.1.git
+
+Typical install time on a "normal" desktop computer: < 5 minutes (clone + open).
+
+B. Run via a simple local server (recommended for some browser features)
+1. Clone the repository:
+   - git clone https://github.com/SchliekerLab/Condenscreen-v1.1.git
+2. Change into the repository directory:
+   - cd Condenscreen-v1.1
+
+- Ensure dependencies are installed by referencing `requirementsPy.txt` (python dependencies) and `requirementsR.txt` (R dependencies)
+  - Then install dependencies:
+    - For python: conda [or pip] install X
+    -For R: install.packages(“X”)
+
+Typical install + serve time on a "normal" desktop computer: < 10 minutes.
+
+----
+Instructions to run demo (static web version)
+1. Serve the repo as shown above (or open the demo HTML file directly).
+2. Navigate to the demo page (e.g., `demo/index.html`) or the main interface.
+3. Follow instructions in the associated README.md
+
+--------------------
+How to run the software on your data (general guidance)
+1. Import raw microscopy images into CellProfiler pipeline (Condenscreen-v1.1/DownloadCondenScreen/CondenScreen.cpproj). Update CellProfiler pipeline to account for your particular data structure (e.g., if only two channels you would remove channel three as it is not needed) and update all pathnames to save to your personal output directory. Update metadata as needed. Configure thresholding and analysis options as indicated.
+2. Using the .rmd script (Condenscreen-v1.1/DownloadCondenScreen/ CondenScreenV2.Rmd) and R Script (Condenscreen-v1.1/DownloadCondenScreen/process_batch.R) update path names. Import tabular data that was exported from CellProfiler in step #1.
+3. Configure any parameters in the UI and run the analysis.
+4. Download/export results and figures. Analysis complete.
+
+Expected outputs
+----------------
+- Visualizations and downloadable result files (.xlsx / .png or .tif). 
+-Rank ordered list of gene or chemical hits.
 
 
+Reproduction instructions
+----------------
+Please refer to the methods section of the associated manuscript to ensure all parameters (thresholding, size, etc.) are exactly the same when running demo data. Update and adjust as needed when analyzing independent datasets.
+
+The data in associated manuscript used the following versions of main software dependencies:
+    -R version 4.3.3 
+    -R Studio (Version 2023.12.1+402)
+    -CellProfiler 4.2.6
+    -IPython: 8.20.0 
+    -Python 3.11.8 (packaged by conda-forge)
+
+
+Repository structure (typical)
+-----------------------------
+- Example/— demo pages and demo data
+- CondensateML/ — trained machine learning model to distinguish condensate 
+- DownloadCondenScreen/ — main CondenScreen scripts and custom CellProfiler pipeline
+
+
+
+
+License
+-------
+This project is released under the Apache License Version 2.0, January 2004. See the LICENSE file for full terms.
+
+
+
+<img width="468" height="645" alt="image" src="https://github.com/user-attachments/assets/1b67529a-9654-46cc-aad7-15e95dffc3c7" />
 
  
 
