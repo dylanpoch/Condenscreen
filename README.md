@@ -120,7 +120,7 @@ How to run the software on your data (general guidance)
 Expected outputs
 ----------------
 - Visualizations and downloadable result files (.xlsx / .png or .tif). 
--Rank ordered list of gene or chemical hits.
+- Rank ordered list of gene or chemical hits.
 
 
 Reproduction instructions
@@ -128,14 +128,14 @@ Reproduction instructions
 Please refer to the methods section of the associated manuscript to ensure all parameters (thresholding, size, etc.) are exactly the same when running demo data. Update and adjust as needed when analyzing independent datasets.
 
 The data in associated manuscript used the following versions of main software dependencies:
-    -R version 4.3.3 
-    -R Studio (Version 2023.12.1+402)
-    -CellProfiler 4.2.6
-    -IPython: 8.20.0 
-    -Python 3.11.8 (packaged by conda-forge)
+  - R version 4.3.3 
+  - R Studio (Version 2023.12.1+402)
+  - CellProfiler 4.2.6
+  - IPython: 8.20.0 
+  - Python 3.11.8 (packaged by conda-forge)
 
 
-Repository structure (typical)
+Repository structure  
 -----------------------------
 - Example/— demo pages and demo data
 - CondensateML/ — trained machine learning model to distinguish condensate 
@@ -147,12 +147,3 @@ Repository structure (typical)
 License
 -------
 This project is released under the Apache License Version 2.0, January 2004. See the LICENSE file for full terms.
-
-
-
-<img width="468" height="645" alt="image" src="https://github.com/user-attachments/assets/1b67529a-9654-46cc-aad7-15e95dffc3c7" />
-
- 
-
-
-
