@@ -1,5 +1,5 @@
 # CondenScreen Demo Workflow
-
+## To access the associated dataset for this demo, see: [CondenScreen Demo Data](https://zenodo.org/records/17703047)
 This folder contains a complete demonstration of the CondenScreen high-throughput screening analysis pipeline. Follow these steps to process demo data and reproduce the results shown in `DemoData.xlsx`.
 
 ## Workflow Overview
