@@ -135,7 +135,7 @@ The data in associated manuscript used the following versions of main software d
 
 Repository structure  
 -----------------------------
-- Example/— demo pages and demo data
+- Demo/— demo pages and demo data
 - CondensateML/ — trained machine learning model to distinguish condensate 
 - DownloadCondenScreen/ — main CondenScreen scripts and custom CellProfiler pipeline
 
