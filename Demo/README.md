@@ -10,7 +10,7 @@ The CondenScreen pipeline consists of three main steps:
 2. **Data Integration**: Import processed data into R
 3. **Statistical Analysis**: Generate Z-scores and individual compound scores
 
-Complete estimated run time using ~ 10 min with an AMD Ryzen 7 2700X, 64 GB RAM, NVIDIA GeForce RTX 2070.
+#### Complete estimated run time using ~ 10 min with an AMD Ryzen 7 2700X, 64 GB RAM, NVIDIA GeForce RTX 2070.
 ---
 
 ## Step 1: Image Processing with CellProfiler
