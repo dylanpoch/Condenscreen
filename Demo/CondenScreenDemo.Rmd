@@ -393,7 +393,6 @@ shinyApp(ui = ui, server = server)
 #############################################################  
 #Make sure all pathways use foward slash (/)!
 save_Location <- "/home/userX/pathsource/"
-save_Location <- "D:/PochEtAl/RawFigureData/Demo/"
 #############################################################
 
 dfSelection <-  fread(paste0(save_Location, "well_selection.csv"))
@@ -1176,3 +1175,4 @@ freezePane(wb, sheet = "Combined Analysis", firstActiveRow = 2)
 
 saveWorkbook(wb, export_File, overwrite = TRUE)
 ```
+
