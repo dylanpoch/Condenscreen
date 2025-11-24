@@ -47,7 +47,7 @@ The `CondenScreenDemo.Rmd` file includes an interactive GUI for well plate confi
    - **Unselected Rows**: Leave rows **A** and **P** unselected (edge wells)
    - **Negative Control**: Designated as "Negative Ctrl"
 
-![CondenScreen Well Selection GUI](image.png)
+![CondenScreen Well Selection GUI](Demo/images/examplePlate.png) 
 
 ### Save Well Selection File
 
@@ -86,6 +86,9 @@ The script will generate:
 ---
 
 ## Expected Results
+Your results should look similar to the following output:
+
+![CondenScreen Example Output](Demo/images/BZScore.png)
 
 ### Assay Quality Metrics
 
