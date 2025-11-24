@@ -52,9 +52,9 @@ The `CondenScreenDemo.Rmd` file includes an interactive GUI for well plate confi
 ### Save Well Selection File
 
 After configuring wells in the GUI:
-1. Set the **Save Directory** to point to the same location as `process_batchDemo.R`
+1. Set the **Save Directory** to point to the same location as `process_batch.R`
 2. Name the file: `well_selection.csv`
-3. **Important**: Save `well_selection.csv` directly to the same directory as `process_batchDemo.R`
+3. **Important**: Save `well_selection.csv` directly to the same directory as `process_batch.R`
 
 ---
 
@@ -67,7 +67,7 @@ After configuring wells in the GUI:
 
 ### Run the R Analysis Script
 
-1. Open `process_batchDemo.R` in RStudio
+1. Open `process_batch.R` in RStudio
 2. **Update all file paths** to match your system:
    - Path to CellProfiler output CSV files
    - Path to `DemoMetadata.xlsx`
