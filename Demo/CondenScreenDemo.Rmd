@@ -8,61 +8,38 @@ Try executing this chunk by clicking the *Run* button within the chunk or by pla
 ```{r}
 #PACKAGES
 #------------------------------------------------------------------------------
-  
-#---- Install Required Packages (Uncomment and run chunk if needed) ----
-# install.packages("knitr")
-# install.packages("DBI")
-# install.packages("ggpval")
-# install.packages("openxlsx")
-# install.packages("ggplot2")
-# install.packages("EnvStats")
-# install.packages("ggpubr")
-# install.packages("psych")
-# install.packages("stringr")
-# install.packages("plotrix")
-# install.packages("BSDA")
-# install.packages("dplyr")
-# install.packages("readr")
-# install.packages("ggplate")
-# install.packages("ggrepel")
-# install.packages("tidyr")
-# install.packages("data.table")
-# install.packages("progress")
-# install.packages("shiny")
-# install.packages("plotly")
-# install.packages("tidyverse")
-# install.packages("htmltools")
-# install.packages("sass")
-# install.packages("rlang")
+# Packages are automatically installed if missing to ensure reproducibility
 
-#-----------------------------------
-#Import libraries:
-library(knitr)
-library(DBI)
-library(ggpval)
-library(openxlsx)
-library(ggplot2)
-library(EnvStats)
-library(ggpubr)
-library(psych)
-library(stringr)
-library(plotrix)
-library(BSDA)
-library(dplyr)
-library(readr)
-library(ggplate)
-library(ggrepel)
-library(tidyr)
-library(data.table)
-library(progress)
-library(openxlsx)
-library(shiny)
-library(plotly)
-library(tidyverse)
-library(htmltools)
-library(shiny)
-library(sass)
-library(rlang)
+required_packages <- c(
+  "tidyverse",
+  "knitr",
+  "DBI",
+  "ggpval",
+  "openxlsx",
+  "EnvStats",
+  "ggpubr",
+  "psych",
+  "plotrix",
+  "BSDA",
+  "ggrepel",
+  "data.table",
+  "progress",
+  "shiny",
+  "plotly",
+  "htmltools",
+  "sass",
+  "rlang"
+)
+
+installed <- rownames(installed.packages())
+
+for (pkg in required_packages) {
+  if (!pkg %in% installed) {
+    message("Installing package: ", pkg)
+    install.packages(pkg, dependencies = TRUE)
+  }
+  library(pkg, character.only = TRUE)
+}
  
 ```
 
