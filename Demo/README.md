@@ -57,6 +57,7 @@ After configuring wells in the GUI:
 2. Name the file: `well_selection.csv`
 3. **Important**: Save `well_selection.csv` directly to the same directory as `process_batch.R`
 
+## Close out RShiny GUI and continue processing code:
 ---
 
 ## Step 3: Import Data and Run Analysis
