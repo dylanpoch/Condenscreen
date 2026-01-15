@@ -621,126 +621,111 @@ combined_DfTemp <- combined_Df
 
 
 ```{r}
-
+# B-SCORE CALCULATION (CONTROLS FOR POSITIONAL EFFECTS) 
 #------------------------------------------------------------------------------
-# B-SCORE CALCULATION (CONTROLS FOR POSITIONAL EFFECTS)
-#------------------------------------------------------------------------------
-# Convert to matrix format for median polish algorithm
-# B-score normalizes for row/column effects in plates
-# BScore_func <- function(df) {
 
-BScore_func <- function(df) {
-  
-  temp_df <- df 
+BScore_func <- function(df, rows, cols,
+                        effect_col = "PercentChange",
+                        well_col   = "Well_Num") {
 
-  # Extract well coordinates (e.g., A01, B02, etc.)
-  letters = substr(temp_df$Well_Num, 1, 1)  # Row (A, B, C...)
-  numbers = as.numeric(substr(temp_df$Well_Num, 2, 
-                               nchar(as.character(temp_df$Well_Num))))  # Column (1, 2, 3...)
-  
-  # Get unique row and column values
-  unique_letters = unique(letters)
-  unique_numbers = unique(numbers)
-  
-  # Create empty matrix with proper dimensions
-  mtx = matrix(NA, 
-                nrow = length(unique_letters), 
-                ncol = length(unique_numbers), 
-                dimnames = list(unique_letters, unique_numbers))
-  
-  # Fill matrix with normalized effect values
-  for (i in 1:nrow(temp_df)) {
-    row_index <- match(letters[i], rownames(mtx))
-    col_index <- match(numbers[i], colnames(mtx))
-    mtx[row_index, col_index] <- as.numeric(temp_df$PercentChange[i])
+  temp_df <- df
+
+  # Full plate indexing
+  row_levels <- LETTERS[1:rows]
+  col_levels <- 1:cols
+
+  # Parse wells like A01, B12, etc.
+  well <- as.character(temp_df[[well_col]])
+  r <- substr(well, 1, 1)
+  cnum <- suppressWarnings(as.integer(sub("^[A-Za-z]+", "", well)))
+
+  keep <- !is.na(r) & !is.na(cnum) & r %in% row_levels & cnum %in% col_levels
+  if (!any(keep)) {
+    return(dplyr::tibble(Well_Num = character(0), BScore = numeric(0), BZ_Score = numeric(0)))
   }
-  
-  # See: https://academic.oup.com/bioinformatics/article/28/13/1775/235775
-  # and: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4653387/
-  
-  #Replaces NAs that would crash the code with median values of plate, if applicable.
-  bScore <- tryCatch({
-  mtx_Polish <- medpolish(mtx)
-  residuals <- mtx_Polish$residuals
-  
-  # Calculate median absolute deviation for scaling
-  MAD <- mad(residuals, constant = 1)
-  
-  # Calculate B-score = residuals / MAD
-  residuals / MAD
-   
-}, error = function(e) {
-  
-  # Fallback if medpolish fails
-  num_NA <- length(mtx[is.na(mtx)])
-  message(paste0("B-score calculation failed for this plate, replacing ", num_NA, " NA's with plate median... Trying again."))
-  mtx_mean <- mean(mtx, na.rm = TRUE)
-  mtx[is.na(mtx)] <- mtx_mean
-  
-  mtx_Polish <- medpolish(mtx)
-  residuals <- mtx_Polish$residuals
-  
-  # Calculate median absolute deviation for scaling
-  MAD <- mad(residuals, constant = 1)
-  
-  # Calculate B-score = residuals / MAD
-  residuals / MAD
-   
-}) 
-  
-  # Convert matrix back to dataframe
-  row_names <- rownames(bScore)
-  col_names <- colnames(bScore)
-  BScoreDf <- data.frame(Well_Condition = character(), BScore = numeric())
-  
-  # Process each element in the matrix
-  for (i in 1:nrow(bScore)) {
-    for (j in 1:ncol(bScore)) {
-      if (!is.na(bScore[i, j])) {
-        # Format well ID with leading zeros for column numbers (A01, A02...)
-        Well_Condition <- paste0(row_names[i], sprintf("%02d", as.numeric(col_names[j])))
-        # Add to dataframe
-        BScoreDf <- rbind(BScoreDf, 
-                          data.frame(Well_Num = Well_Condition, 
-                                     BScore = bScore[i, j]))
-      }
-    }
-  }
-  
-  
-  # Calculate B-score statistics
-  avg_B <- mean(BScoreDf$BScore)
-  SD_B <- sd(BScoreDf$BScore)
-  
-  # Calculate B-score Z-scores for hit identification
-  BScoreDf$BZ_Score <- (BScoreDf$BScore - avg_B) / SD_B
-  
-  original_wells <- unique(temp_df$Well_Num)
-  BScoreDf <- BScoreDf %>% filter(Well_Num %in% original_wells)
+
+  # Build full plate matrix
+  mtx <- matrix(NA_real_, nrow = rows, ncol = cols,
+                dimnames = list(row_levels, as.character(col_levels)))
+
+  eff <- suppressWarnings(as.numeric(temp_df[[effect_col]]))
+
+  # Fill matrix (vectorized)
+  mtx[cbind(match(r[keep], row_levels), match(cnum[keep], col_levels))] <- eff[keep]
+
+  # Median polish + MAD scaling (B-score)
+  bmat <- tryCatch({
+    mp <- stats::medpolish(mtx, trace.iter = FALSE)
+    resid <- mp$residuals
+    MAD <- stats::mad(resid, constant = 1, na.rm = TRUE)
+    if (is.na(MAD) || MAD == 0) MAD <- 1
+    resid / MAD
+  }, error = function(e) {
+    # Fallback: impute missing with plate median and retry
+    fill <- stats::median(mtx, na.rm = TRUE)
+    if (is.na(fill)) fill <- 0
+    mtx[is.na(mtx)] <- fill
+
+    mp <- stats::medpolish(mtx, trace.iter = FALSE)
+    resid <- mp$residuals
+    MAD <- stats::mad(resid, constant = 1, na.rm = TRUE)
+    if (is.na(MAD) || MAD == 0) MAD <- 1
+    resid / MAD
+  })
+
+  # Convert to tibble for wells present in this df
+  out <- expand.grid(
+    Row = row_levels,
+    Col = col_levels,
+    stringsAsFactors = FALSE
+  )
+  out$Well_Num <- paste0(out$Row, sprintf("%02d", out$Col))
+  out$BScore   <- as.vector(bmat)
+
+  out <- dplyr::as_tibble(out) %>%
+    dplyr::filter(.data$Well_Num %in% unique(well[keep])) %>%
+    dplyr::select(.data$Well_Num, .data$BScore)
+
+  # BZ-score (within-plate normalization of B-score)
+  mu <- mean(out$BScore, na.rm = TRUE)
+  sdv <- stats::sd(out$BScore, na.rm = TRUE)
+  if (is.na(sdv) || sdv == 0) sdv <- 1
+
+  out <- out %>%
+    dplyr::mutate(BZ_Score = (.data$BScore - mu) / sdv)
+
+  out
 }
 
+# ---- RUN B-SCORE ONLY WHEN:
+# (1) assayType == "OFF" AND (2) plateSize >= 96
+# Should not use BZ-Score if plate size is smaller than 96 wells
+if (assayType == "OFF" && plateSize >= 96) {
 
+  bs_res <- temp_stats_Df %>%
+    dplyr::group_by(plate_Num) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(bscores = purrr::map(data, ~BScore_func(.x, rows = rows, cols = cols))) %>%
+    tidyr::unnest(bscores)
 
-#Only use BZ-score when assay is Signal-off [due to higher noise and extra normalization for plate-to-plate variation]
-if(assayType == "OFF"){
-  temp_stats_Df$BScore <- temp_stats_Df %>% 
-  group_by(plate_Num) %>% 
-  nest() %>%
-  mutate(bscores = map(data, BScore_func)) %>%
-  unnest(bscores) %>%
-   pull(BScore)
- 
- 
- temp_stats_Df$BZScore <- temp_stats_Df %>% 
-  group_by(plate_Num) %>% 
-  nest() %>%
-  mutate(bscores = map(data, BScore_func)) %>%
-  unnest(bscores) %>%
-   pull(BZ_Score)
-  
+  # Join back safely by plate + well (no row-order assumptions)
+  temp_stats_Df <- temp_stats_Df %>%
+    dplyr::left_join(bs_res, by = c("plate_Num", "Well_Num")) %>%
+    dplyr::rename(BZScore = BZ_Score)
+
+} else {
+  # Explicitly create columns so downstream code doesn't break
+  temp_stats_Df$BScore  <- NA_real_
+  temp_stats_Df$BZScore <- NA_real_
+
+  if (assayType == "OFF" && plateSize < 96) {
+    message("Skipping B-score: plate size < 96 wells (medpolish is unstable with too few wells).")
+  }
 }
 
+# Merge into combined_Df as before
 combined_Df <- merge(combined_Df, temp_stats_Df, all = TRUE)
+
 ```
 
 
