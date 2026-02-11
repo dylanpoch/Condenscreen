@@ -1,0 +1,427 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+#CondenScreen Low-throughput validation analysis script
+#Date: 2/11/2026
+#Version: 2024.12.1+563
+#Author: Dylan Poch
+############################################################
+### ================= USER SETTINGS ===================== ###
+############################################################
+ 
+base_path  <- "C:/Your/Path/Here/"
+#base_path <- "C:/Users/Schlieker Lab/Desktop/New_Data_AFTER_23_11_17/Dylan_new/Random_projects/26_-1_31_CBB_dp_EXPORT/Results/" #Example
+input_file <- "YourCellProfilerExport.csv"
+#input_file <- "CBBNuclei.csv"   #Example
+negative_control_label <- "DMSO"   # EXACT name in Condition column
+
+plot_title_violin <- "MLF2-GFP Foci"
+plot_title_bar    <- "MLF2-GFP Foci Distribution"
+plot_title_cns    <- "CNS Score Distribution:"
+
+output_prefix <- "Phenotype_Analysis"
+
+top_fraction <- 0.50   # optional filtering if activated
+
+low_cutoff <- 30
+mid_cutoff <- 75
+
+y_axis_label_violin <- "MLF2-GFP Count per Cell"
+y_axis_label_bar    <- "Proportion of Cells"
+
+############################################################
+### ================= LOAD PACKAGES ===================== ###
+############################################################
+
+required_pkgs <- c("openxlsx","ggplot2","dplyr","tidyr","ggpubr","rstatix","scales")
+
+for (pkg in required_pkgs) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+windowsFonts(Arial = windowsFont("Arial"))  # ensures Arial works on Windows
+
+
+############################################################
+### ================= LOAD & PREP DATA ================= ###
+############################################################
+
+df_raw <- read.csv(file.path(base_path, input_file))
+
+ 
+  
+df <- df_raw %>%
+  select(
+    Image  = ImageNumber,
+    Cell   = ObjectNumber,
+    File   = FileName_DAPI,
+    any_of(c("Children_Foci_Count", "Children_GFP_foci_Count")),
+    any_of("Intensity_IntegratedIntensity_tdtomato")
+  )
+
+if ("Children_Foci_Count" %in% colnames(df)) {
+  df <- df %>% rename(Foci = Children_Foci_Count)
+} else if ("Children_GFP_foci_Count" %in% colnames(df)) {
+  df <- df %>% rename(Foci = Children_GFP_foci_Count)
+}
+
+if ("Intensity_IntegratedIntensity_tdtomato" %in% colnames(df)) {
+  df <- df %>%
+    rename(TdTomato_Intensity = Intensity_IntegratedIntensity_tdtomato)
+}
+
+# Assign experimental condition based on filename pattern
+df <- df %>%
+  mutate(Condition = case_when(
+    grepl("Nif_100uM", File) ~ "Condition A",
+    grepl("DMSO", File) ~ "DMSO",
+   #grepl("Condition_C", File) ~ "Condition C"
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(Condition))   # removes everything not explicitly listed
+
+sub_df2 <- df   # master dataset
+
+
+############################################################
+### ===== OPTIONAL: KEEP TOP FRACTION PER CONDITION ===== ###
+### (Uncomment to activate. Overwrites sub_df2)          ###
+############################################################
+
+# sub_df2 <- sub_df2 %>%
+#   group_by(Condition) %>%
+#   arrange(Foci, .by_group = TRUE) %>%
+#   mutate(rank = row_number(),
+#          cutoff = ceiling(n() * top_fraction)) %>%
+#   filter(rank > cutoff) %>%
+#   ungroup()
+
+
+############################################################
+### ================= VIOLIN PLOT ====================== ###
+############################################################
+
+# Summary stats for reporting
+summary_stats <- sub_df2 %>%
+  group_by(Condition) %>%
+  summarise(
+    N_Cells = n(),
+    Mean_Foci = mean(Foci),
+    Median_Foci = median(Foci),
+    SD_Foci = sd(Foci),
+    SEM_Foci = SD_Foci / sqrt(N_Cells),
+    .groups = "drop"
+  )
+
+# Mann–Whitney U tests vs leftmost condition
+sub_df2$Condition <- factor(sub_df2$Condition, levels = unique(sub_df2$Condition))
+
+stat_tests <- sub_df2 %>%
+  wilcox_test(Foci ~ Condition, ref.group = levels(sub_df2$Condition)[1]) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance("p.adj")
+
+# Stagger p-value brackets
+y_max <- max(sub_df2$Foci, na.rm = TRUE)
+stat_tests <- stat_tests %>%
+  arrange(group2) %>%
+  mutate(y.position = y_max * (1.05 + row_number() * 0.06))
+
+# Locked color palette
+conditions <- levels(sub_df2$Condition)
+n_cond <- length(conditions)
+
+gray   <- "#4A4A4A"
+blue   <- "#6E97AD"
+purple <- "#6B5A8E"
+
+if (n_cond == 1) fill_colors <- gray else
+if (n_cond == 2) fill_colors <- c(gray, blue) else
+if (n_cond == 3) fill_colors <- c(gray, blue, purple) else {
+  grad_cols <- colorRampPalette(c(gray, blue, purple))(n_cond)
+  grad_cols[1] <- gray
+  grad_cols[round(n_cond/2)] <- blue
+  grad_cols[n_cond] <- purple
+  fill_colors <- grad_cols
+}
+names(fill_colors) <- conditions
+
+# Compute medians for solid lines
+median_df <- sub_df2 %>%
+  group_by(Condition) %>%
+  summarise(med = median(Foci), .groups = "drop")
+
+# Build violin plot
+plot_violin <- ggviolin(sub_df2, x="Condition", y="Foci",
+                        fill="Condition", trim=TRUE, alpha=0.85, color="black") +
+  geom_jitter(width=0.12, size=1.5, alpha=0.6) +
+  geom_segment(data=median_df,
+               aes(x=as.numeric(Condition)-0.25, xend=as.numeric(Condition)+0.25,
+                   y=med, yend=med), inherit.aes=FALSE,
+               color="black", linewidth=0.7) +
+  stat_pvalue_manual(stat_tests, label="p.adj.signif",
+                     bracket.size=0.4, tip.length=0.01, size=7, color="black") +
+  labs(title=plot_title_violin, y=y_axis_label_violin, x=NULL) +
+  scale_fill_manual(values=fill_colors) +
+  theme_classic(base_size=16) +
+  theme(text=element_text(family="Arial", face="bold"),
+        plot.title=element_text(size=22, hjust=0.5),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        axis.text.x=element_text(angle=25, hjust=1),
+        legend.position="right")
+
+
+
+ggsave(file.path(base_path, paste0(output_prefix, "_ViolinPlot.png")),
+       plot_violin, width=10, height=8, dpi=300)
+
+
+############################################################
+### ================= STACKED BAR PLOT ================= ###
+############################################################
+# Bin foci counts
+binned_df <- sub_df2 %>%
+  mutate(Foci_bin = case_when(
+    Foci <= low_cutoff ~ paste0("0–", low_cutoff, " foci"),
+    Foci > low_cutoff & Foci < mid_cutoff ~ paste0(low_cutoff, "–", mid_cutoff, " foci"),
+    Foci >= mid_cutoff ~ paste0(">", mid_cutoff, " foci")
+  ))
+
+# Proportion per bin
+totals <- binned_df %>%
+  count(Condition, name="total_cells")
+
+bin_summary <- binned_df %>%
+  count(Condition, Foci_bin, name="cells_in_bin") %>%
+  left_join(totals, by="Condition") %>%
+  mutate(prop = cells_in_bin / total_cells)
+
+# Highest foci at bottom of stack
+bin_levels <- c(
+ paste0("0–", low_cutoff, " foci"),
+  paste0(low_cutoff, "–", mid_cutoff, " foci"),
+   paste0(">", mid_cutoff, " foci")
+)
+
+# Match color order to bin_levels - darker blue for highest bin (first/bottom)
+bin_colors <- c( "grey75", "grey40", "#2C6A88")
+names(bin_colors) <- bin_levels
+
+# Convert Foci_bin to factor with specified levels
+bin_summary <- bin_summary %>%
+  mutate(Foci_bin = factor(Foci_bin, levels = bin_levels))
+
+plot_bar <- ggplot(bin_summary, aes(x=Condition, y=prop, fill=Foci_bin)) +
+  geom_col(width=0.7, color="black", alpha=0.95) +
+  scale_y_continuous(labels=scales::percent_format(accuracy=1), 
+                     expand=expansion(mult=c(0,0.05))) +
+  scale_fill_manual(values=bin_colors, name="GFP foci per cell") +
+  labs(title=plot_title_bar, y=y_axis_label_bar, x=NULL) +
+  theme_classic(base_size=16) +
+  theme(text=element_text(family="Arial", face="bold"),
+        plot.title=element_text(size=22, hjust=0.5),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        axis.text.x=element_text(size=16, angle=25, hjust=1),
+        legend.position="right")
+
+ggsave(file.path(base_path, paste0(output_prefix, "_StackedBars.png")),
+       plot_bar, width=10, height=8, dpi=300)
+
+
+
+
+############################################################
+### ===== OPTIONAL: ADDITIONAL VIOLIN PLOTS (CNS + TDT) ###
+### (Safe to run; only executes if data columns exist)   ###
+############################################################
+
+# Ensure Condition factor order matches main plot
+sub_df2$Condition <- factor(sub_df2$Condition, levels = unique(sub_df2$Condition))
+
+# Reuse same color palette from main violin
+extra_fill_colors <- fill_colors
+
+
+
+############################################################
+### ================= EXPORT TO EXCEL ================== ###
+############################################################
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "Filtered_Data")
+writeData(wb, "Filtered_Data", sub_df2)
+
+addWorksheet(wb, "Summary_Stats")
+writeData(wb, "Summary_Stats", summary_stats)
+
+addWorksheet(wb, "Statistical_Tests")
+writeData(wb, "Statistical_Tests", stat_tests)
+
+addWorksheet(wb, "StackedBar_Proportions")
+writeData(wb, "StackedBar_Proportions", bin_summary)
+
+
+
+
+
+##############################
+# ---  TdTomato Intensity ---
+##############################
+
+if ("TdTomato_Intensity" %in% colnames(sub_df2)) {
+
+ 
+  # Stats vs control
+  stat_tdt <- sub_df2 %>%
+    wilcox_test(TdTomato_Intensity ~ Condition,
+                ref.group = levels(sub_df2$Condition)[1]) %>%
+    adjust_pvalue(method = "BH") %>%
+    add_significance("p.adj")
+
+  y_max_tdt <- max(sub_df2$TdTomato_Intensity, na.rm = TRUE)
+
+  stat_tdt <- stat_tdt %>%
+    arrange(group2) %>%
+    mutate(y.position = y_max_tdt * (1.05 + row_number() * 0.06))
+
+  median_tdt <- sub_df2 %>%
+    group_by(Condition) %>%
+    summarise(med = median(TdTomato_Intensity, na.rm = TRUE), .groups = "drop")
+
+  plot_tdt <- ggviolin(sub_df2, x="Condition", y="TdTomato_Intensity",
+                       fill="Condition", trim=TRUE, alpha=0.85, color="black") +
+    geom_jitter(width=0.12, size=1.5, alpha=0.6) +
+    geom_segment(data=median_tdt,
+                 aes(x=as.numeric(Condition)-0.25, xend=as.numeric(Condition)+0.25,
+                     y=med, yend=med),
+                 inherit.aes=FALSE, color="black", linewidth=0.7) +
+    stat_pvalue_manual(stat_tdt, label="p.adj.signif",
+                       bracket.size=0.4, tip.length=0.01, size=7, color="black") +
+    labs(title="TdTomato Integrated Intensity",
+         y="Integrated Intensity (TdTomato)", x=NULL) +
+    scale_fill_manual(values=extra_fill_colors) +
+    theme_classic(base_size=16) +
+    theme(text=element_text(family="Arial", face="bold"),
+          plot.title=element_text(size=22, hjust=0.5),
+          axis.title.y=element_text(size=20),
+          axis.text.y=element_text(size=18),
+          axis.text.x=element_text(angle=25, hjust=1),
+          legend.position="right") +
+    coord_cartesian(ylim=c(0, max(stat_tdt$y.position)*1.1), clip="off")
+
+  ggsave(file.path(base_path, paste0(output_prefix, "_TdTomato_Violin.png")),
+         plot_tdt, width=10, height=8, dpi=300, device=ragg::agg_png)
+  
+    
+    
+  addWorksheet(wb, "TdTomato_Stats")
+  writeData(wb, "TdTomato_Stats", stat_tdt)
+  
+  addWorksheet(wb, "TdTomato_Median")
+  writeData(wb, "TdTomato_Median", median_tdt)
+
+
+
+}
+
+
+ 
+############################################################
+### ================= CNS CALCULATION ================== ###
+############################################################
+
+if (all(c("Foci", "TdTomato_Intensity") %in% colnames(sub_df2))) {
+  
+  
+  
+
+  control_mean_foci <- mean(sub_df2$Foci[sub_df2$Condition == negative_control_label], na.rm = TRUE)
+  control_mean_tdt  <- mean(sub_df2$TdTomato_Intensity[sub_df2$Condition == negative_control_label], na.rm = TRUE)
+
+  sub_df2$CNS <- (1 - (sub_df2$Foci / control_mean_foci)) *
+                 (sub_df2$TdTomato_Intensity / control_mean_tdt)^2
+
+  control_median <- median(sub_df2$CNS[sub_df2$Condition == negative_control_label], na.rm = TRUE)
+
+  total_cells <- sub_df2 %>%
+    group_by(Condition) %>%
+    summarise(total_n = n(), .groups = "drop")
+
+  sub_df2_filt <- sub_df2 %>%
+    filter(CNS >= control_median) %>%
+    mutate(
+      CNS_bin = case_when(
+        CNS >= control_median & CNS < 0.25 ~ "Baseline–0.25",
+        CNS >= 0.25 & CNS < 1              ~ "0.25–1",
+        CNS >= 1                           ~ "1+"
+      ),
+      CNS_bin = factor(CNS_bin, levels = c("Baseline–0.25","0.25–1","1+"))
+    )
+
+  cns_dist <- sub_df2_filt %>%
+    group_by(Condition, CNS_bin) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    left_join(total_cells, by = "Condition") %>%
+    mutate(prop_total = n / total_n)
+
+  cns_dist_plot <- cns_dist %>%
+    filter(Condition != negative_control_label)
+  
+  
+    plot_cns_binned <- ggplot(cns_dist_plot,
+                            aes(x = Condition, y = prop_total, fill = CNS_bin)) +
+    geom_col(width = 0.75, color = "black") +
+    scale_fill_manual(values = c(
+      "Baseline–0.25" = "#BDBDBD",
+      "0.25–1"        = "#4B4B4B",
+      "1+"            = "#3B4CC0"
+    )) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       limits = c(0, 1)) +
+    labs(title = plot_title_cns,
+         y = "Fraction of Total Cells",
+         x = NULL,
+         fill = "Rescue Strength") +
+    theme_classic(base_size = 16) +
+    theme(
+      text = element_text(family = "Arial", face = "bold"),
+      plot.title = element_text(size = 22, hjust = 0.5),
+      axis.title.y = element_text(size = 20),
+      axis.text.y = element_text(size = 18),
+      axis.text.x = element_text(angle = 25, hjust = 1),
+      legend.position = "right"
+    )
+
+  ggsave(file.path(base_path, paste0(output_prefix, "_CNS_Distribution.png")),
+         plot_cns_binned, width = 10, height = 8, dpi = 300, device = ragg::agg_png)
+  
+  
+    addWorksheet(wb, "CNS_Distribution")
+  writeData(wb, "CNS_Distribution", cns_dist)
+
+}
+ 
+
+saveWorkbook(wb,
+  file.path(base_path, paste0(output_prefix, "_Analysis.xlsx")),
+  overwrite=TRUE)
+
+```
+
+ 
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
