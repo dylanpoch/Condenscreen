@@ -361,7 +361,7 @@ file_paths <- list.files(file_Location, pattern="pharmakon", full.names=TRUE, re
 #############################################################
 
 # Check if the file exists
-path_to_batchScript <- paste0(file_Location, "process_batchtdTomato.R")
+path_to_batchScript <- paste0(file_Location, "process_batch.R")
 
 if (file.exists(path_to_batchScript)) {
   cat("The batch script exists. Success!\n")
@@ -378,7 +378,7 @@ stopifnot(total_files > 0)  # fail early instead of launching nothing
 
 total_batches <- ceiling(total_files / batch_size)
 
-script_path <- file.path(file_Location, "process_batchtdTomato.R")
+script_path <- file.path(file_Location, "process_batch.R")
 stopifnot(file.exists(script_path))
 
 for (i in 1:total_batches) {
@@ -1110,9 +1110,38 @@ microcephaly  <- c("ZNF335", "SIN3A", "SPDL1", "CDK5", "NCAPD3", "CIT", "SHH")
 
 #############################################################
 
-
+sheet_hits = "Hits"
+sheet_df = "Combined Analysis"
 merged_df <- merged_df[!is.na(merged_df$Reference), ]  # Keep only rows with reference names (compounds, genes, etc.)
 
+assayType = "OFF"
+# 1) Build hits_df2 (hits + QC columns)
+hits_df <- if (assayType == "OFF") {
+  merged_df %>% filter(BZScore >= 3)
+} else {
+  merged_df %>% filter(ZScore >= 3)
+}
+
+# (optional) make factors safe for Excel
+hits_df <- hits_df %>% mutate(across(where(is.factor), as.character))
+merged_df2 <- merged_df %>% mutate(across(where(is.factor), as.character))
+
+# 2) Load the existing workbook and overwrite both sheets
+wb <- loadWorkbook(fileX)
+
+if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
+addWorksheet(wb, sheet_hits)
+writeData(wb, sheet_hits, hits_df, startCol = 1, startRow = 1, colNames = TRUE)
+freezePane(wb, sheet_hits, firstActiveRow = 2)
+addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(hits_df))
+
+if (sheet_df %in% names(wb)) removeWorksheet(wb, sheet_df)
+addWorksheet(wb, sheet_df)
+writeData(wb, sheet_df, merged_df2, startCol = 1, startRow = 1, colNames = TRUE)
+freezePane(wb, sheet_df, firstActiveRow = 2)
+addFilter(wb, sheet_df, rows = 1, cols = 1:ncol(merged_df2))
+
+saveWorkbook(wb, fileX, overwrite = TRUE)
  
 ```
 
@@ -1898,8 +1927,6 @@ invisible(NULL)
 
 
 #Overwrite previous hits sheet in original workbook to add QC measures:
-library(dplyr)
-library(openxlsx)
 
 sheet_hits <- "Hits"
 
@@ -1993,6 +2020,11 @@ cache_flush <- function() {
     ) %>% readr::write_tsv(CACHE_PATH)
   }
 }
+
+use_condaenv("rdkit-env", required = TRUE)
+Chem    <- import("rdkit.Chem")
+RDLogger <- import("rdkit.RDLogger")
+RDLogger$DisableLog("rdApp.*")
 
 # ============================================================
 # 3) Identifier cleaning and SMILES retrieval
@@ -2532,7 +2564,7 @@ df_final <- df_final %>%
 sheet_hits <- "Hits"
 
 # (optional) make factors safe for Excel
-hits_df2 <- hits_df2 %>% mutate(across(where(is.factor), as.character))
+df_final <- df_final %>% mutate(across(where(is.factor), as.character))
 
 # 2) Load the existing workbook and overwrite the Hits sheet
 wb <- loadWorkbook(fileX)
