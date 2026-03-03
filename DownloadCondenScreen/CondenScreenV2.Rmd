@@ -510,7 +510,7 @@ combined_Df <- combined_Df %>%
   ungroup()
 
 #Combine with assigned conditions:
-dfSelection <- dfSelection %>% rename(Well_Num = Well).
+# dfSelection <- dfSelection %>% rename(Well_Num = Well).
 combined_Df <- merge(combined_Df, dfSelection[, c('SignalStatus', 'Condition', 'Well_Num')], by = "Well_Num")
 
 combined_Df <- combined_Df %>% 
@@ -587,7 +587,7 @@ SB_Plate <- plate_Summary %>% group_by(plate_Num) %>%
 
 
 #EXPORT PLATE SUMMARY:
-plate_Summary$ZPrime_Score <- ZPrime_Score[[1]]
+# plate_Summary$ZPrime_Score <- ZPrime_Score[[1]]
 plate_Summary$SB_Plate <- SB_Plate$SB_Plate
 
 p_ctrls <- combined_Df %>% filter( Condition == pos_Ctrl) %>%
