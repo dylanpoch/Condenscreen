@@ -320,7 +320,7 @@ shinyApp(ui = ui, server = server)
 #############################################################  
 #Make sure all pathways use foward slash (/)!
 #save_Location <- "/home/userX/pathsource/"
-save_Location <-"/home/userX/pathsource/"
+save_Location <-"/Users/PathName"
 file_Location<- save_Location
 #############################################################
 
@@ -356,7 +356,7 @@ ChemVGene <- dfSelection$ScreenType[1]
 #############################################################
 
 #file_paths <- dir(file_Location, pattern = "*.FociQuant.*", full.names = TRUE, recursive = TRUE)
-file_paths <- list.files(file_Location, pattern="pharmakon", full.names=TRUE, recursive=TRUE, ignore.case=TRUE)
+file_paths <- list.files(file_Location, pattern = "*.FociQuant.*", full.names=TRUE, recursive=TRUE, ignore.case=TRUE)
 
 #############################################################
 
@@ -539,6 +539,7 @@ combined_Df <- combined_Df %>%
     .groups = "drop"
   )
 
+
 #Determine control statistics:
 pos_Ctrl_DF <- combined_Df %>%
   group_by(plate_Num) %>%
@@ -609,9 +610,8 @@ ctrls <- rbind(p_ctrls, n_ctrls)
 #Combined main dataframe: 
 combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")], by = "plate_Num" )
 
-
-
-  
+print(combined_Df)
+ 
 ```
 
 
@@ -992,9 +992,9 @@ combined_Df_out <- combined_Df_out %>% arrange(desc(ZScore))
  }  
 
 if (assayType == "OFF"){
-  hits_df <- combined_Df_out %>% filter(BZScore >= 3)
+  hits_df <- combined_Df_out %>% filter(BZScore >= 2)
 } else {
-  hits_df <- combined_Df_out %>% filter(ZScore >= 3)
+  hits_df <- combined_Df_out %>% filter(ZScore >= 2)
 }
 
     
@@ -1121,10 +1121,11 @@ sheet_df = "Combined Analysis"
 merged_df <- merged_df[!is.na(merged_df$Reference), ]  # Keep only rows with reference names (compounds, genes, etc.)
 
 # 1) Build hits_df2 (hits + QC columns)
+#Changed BZ-Cutoff for demo mode due to limited image set
 hits_df <- if (assayType == "OFF") {
-  merged_df %>% filter(BZScore >= 3)
+  merged_df %>% filter(BZScore >= 2)
 } else {
-  merged_df %>% filter(ZScore >= 3)
+  merged_df %>% filter(ZScore >= 2)
 }
 
 # (optional) make factors safe for Excel
@@ -1137,26 +1138,27 @@ wb <- loadWorkbook(export_File)
 if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
 addWorksheet(wb, sheet_hits)
 #Order by BZ-Score (descending)
-hits_df <- hits_df %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
-
+hits_df <- hits_df %>% arrange(desc(BZScore))
 writeData(wb, sheet_hits, hits_df, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_hits, firstActiveRow = 2)
 addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(hits_df))
 
 if (sheet_df %in% names(wb)) removeWorksheet(wb, sheet_df)
 addWorksheet(wb, sheet_df)
-
-#Order by BZ-Score (descending)
-merged_df2 <- merged_df2 %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
+merged_df2 <- merged_df2 %>% arrange(desc(BZScore))
 writeData(wb, sheet_df, merged_df2, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_df, firstActiveRow = 2)
 addFilter(wb, sheet_df, rows = 1, cols = 1:ncol(merged_df2))
 
 saveWorkbook(wb, export_File, overwrite = TRUE)
+ 
 ```
 
 ```{r}
 #NORMALIZED SCORE PLOT:
+#NOTE: For demo mode the hit threshold has been changed from 3 to 2. 
+#Also, the Z'-Score is lower.
+#This is due to a much more limited set of images being analyzed, thus requiring more lenient cutoff values.
 #------------------------------------------------------------------------------
 score_col <- if ("BZScore" %in% names(merged_df)) "BZScore" else "ZScore"
 
@@ -1164,7 +1166,7 @@ merged_df <- merged_df %>%
   mutate(
     score_value = .data[[score_col]],
 
-    bz_hit  = score_value >= 3,
+    bz_hit  = score_value >= 2,
 
     td_ok   = if (has_td_int && "tdTomato_Diff" %in% names(.))
                 tdTomato_Diff >= -25
@@ -1188,7 +1190,7 @@ plot_normalized_score <- function(df, assay_type, image_path) {
 
     # ---- background points (BZ < 3)
     geom_point(
-      data = dplyr::filter(df, !!score_col < 3),
+      data = dplyr::filter(df, !!score_col < 2),
       color = "black",
       size = 1,
       alpha = 0.4,
@@ -1197,7 +1199,7 @@ plot_normalized_score <- function(df, assay_type, image_path) {
 
     # ---- BZ >= 3 hits, colored by phenotype logic
 geom_point(
-  data = dplyr::filter(df, !!score_col >= 3),
+  data = dplyr::filter(df, !!score_col >= 2),
   aes(
     color = Reference %in% hits_of_interest,
     size  = Reference %in% hits_of_interest
@@ -1243,7 +1245,7 @@ guides(color = "none", size = "none") +
     guides(color = "none") +
     coord_cartesian(ylim = y_limits) +
     geom_text_repel(
-  data = dplyr::filter(df, !!score_col >= 3),
+  data = dplyr::filter(df, !!score_col >= 2),
   aes(label = Reference),
   size = 4.5,
   fontface = "bold",
@@ -1287,7 +1289,7 @@ plot_normalized_score(merged_df, assayType ,image_Save_Location)
           axis.ticks = element_line(size = 1.2))
   
 
-ggsave(paste(image_Save_Location, "TdTomatoScreenrawdistrpilot.pdf", sep = ""), 
+ggsave(paste(image_Save_Location, "images/TdTomatoScreenrawdistrpilot.pdf", sep = ""), 
         raw_distribution, 
         dpi = 300, 
         width = 10, 
@@ -1313,8 +1315,8 @@ ggsave(paste(image_Save_Location, "TdTomatoScreenrawdistrpilot.pdf", sep = ""),
 #Normalized Distribution Plot:
 if (assayType == "OFF") {
 normalized_dist <- normalized_dist +
-  annotate("text", x = 90, y = 110, label = pos_Ctrl, angle = 90, size = 16) +
-  annotate("text", x = -15, y = 110, label = neg_Ctrl, color = "black", angle = 90, size = 16) +
+  annotate("text", x = 90, y = 18, label = pos_Ctrl, angle = 90, size = 16) +
+  annotate("text", x = -10, y = 18, label = neg_Ctrl, color = "black", angle = 90, size = 16) +
   labs(title = NULL, y = "Count", x = "% Decrease in Foci")
  } else {
 normalized_dist <- normalized_dist +
@@ -1324,7 +1326,7 @@ normalized_dist <- normalized_dist +
  } 
      
   # Save distribution plots
-  ggsave(paste(image_Save_Location, "TdTomatoScreendistrpilot.pdf", sep = ""), 
+  ggsave(paste(image_Save_Location, "images/TdTomatoScreendistrpilot.pdf", sep = ""), 
         normalized_dist, 
         dpi = 300, 
         width = 10, 
@@ -1350,7 +1352,7 @@ normalized_dist <- normalized_dist +
 # 1. CONFIGURATION
 # ============================================================
 #If not previously defined:
-fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
+fileX   <- "/Users/PathName/CondenScreenV2.xlsx"
 
 export_File <- fileX
 sheetX  <- "Combined Analysis"
@@ -1788,6 +1790,7 @@ hit_impact_purple_deeper <- function(max_hits, zero_color = "#F5F5F5") {
     )
   )
 }
+ 
 max_hits_well <- max(grid_sum$hit_sum, na.rm = TRUE)
 
 p_heat_hit <- heatmap_metric(
@@ -1946,9 +1949,9 @@ sheet_hits <- "Hits"
 
 # 1) Build hits_df2 (hits + QC columns)
 hits_df <- if (assayType == "OFF") {
-  merged_df %>% filter(BZScore >= 3)
+  merged_df %>% filter(BZScore >= 2)
 } else {
-  merged_df %>% filter(ZScore >= 3)
+  merged_df %>% filter(ZScore >= 2)
 }
 
 hits_df2 <- hits_df %>%
@@ -1968,7 +1971,7 @@ addWorksheet(wb, sheet_hits)
 
 
 #Order by BZ-Score (descending)
-hits_df2 <- hits_df2 %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
+hits_df2 <- hits_df2 %>% arrange(desc(BZScore))
 
 writeData(wb, sheet_hits, hits_df2, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_hits, firstActiveRow = 2)
@@ -1988,7 +1991,7 @@ saveWorkbook(wb, fileX, overwrite = TRUE)
 #save_Location <- "/home/userX/pathsource/"
 
 #If not previously defined:
-fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
+fileX   <- "/Users/PathName/CondenScreenV2.xlsx"
 
 #Saves cached smiles, if available, to avoid re-querying PubChem/CACTUS
 CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
@@ -2586,7 +2589,7 @@ if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
 addWorksheet(wb, sheet_hits)
 
 #Order by BZ-Score (descending)
-df_final <- df_final %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
+df_final <- df_final %>% arrange(desc(BZScore))
 writeData(wb, sheet_hits, df_final, startCol = 1, startRow = 1, colNames = TRUE)
 
 freezePane(wb, sheet_hits, firstActiveRow = 2)
