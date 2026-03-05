@@ -39,7 +39,7 @@ Originally developed to analyze MLF2-GFP foci, the pipeline can be adapted for o
 Download the files listed above into a working directory. Alternatively, clone this repository via:
 
 ```bash
-git clone https://github.com/dylanpoch/Condenscreen-v1.2.git
+git clone https://github.com/your-username/CondenScreen.git
 ```
 
 ---
@@ -86,13 +86,13 @@ Installation guide
 ------------------
 A. Open locally 
 1. Clone the repository:
-   - git clone https://github.com/dylanpoch/Condenscreen-v1.2.git
+   - git clone https://github.com/your-username/CondenScreen.git
 
 Typical install time on a "normal" desktop computer: < 5 minutes (clone + open).
 
 B. Run via a simple local server (recommended for some browser features)
 1. Clone the repository:
-   - git clone https://github.com/dylanpoch/Condenscreen-v1.2.git
+   - git clone https://github.com/your-username/CondenScreen.git
 2. Change into the repository directory:
    - cd Condenscreen-v1.2
 

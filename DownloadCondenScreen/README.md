@@ -99,7 +99,7 @@ process_batch.R          # Helper script required by CondenScreenV2.Rmd
 Download the files listed above into a working directory. Alternatively, clone this repository via:
 
 ```bash
-git clone https://github.com/dylanpoch/Condenscreen-v1.2.git
+git clone https://github.com/your-username/CondenScreen.git
 ```
 
 ---
