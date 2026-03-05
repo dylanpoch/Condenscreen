@@ -65,8 +65,27 @@ The **CondenScreen** R pipeline includes:
     
 
 - **Quality Control**
-  - Optionally filters bottom 80% of low-expressing cells to limit either uninduced or non-transfected cells
-  - Removes outlier image sets with screening artifacts.
+  
+ - **Chemical triage (small-molecule filters)**
+  - Chemical triage uses curated substructure rule-sets to flag likely assay-interfering or promiscuous compounds; a `PatWalter.csv` file is included (full credit: Pat Walters — https://github.com/PatWalters/rd_filters) and used as one of the primary filter sources.
+    - Rule set / Number of Alerts:
+      - BMS — 180
+      - Dundee — 105
+      - Glaxo — 55
+      - Inpharmatica — 91
+      - LINT — 57
+      - MLSMR — 116
+      - PAINS — 479
+      - SureChEMBL — 166
+      
+    - Additionally, compounds are assessed for cytotoxicity observed within the screen and against the Lipinski Rule of 5.
+  - Filtered and flagged compounds are annotated in the output tables so users can prioritize follow-up validation on high-confidence candidates.
+
+ - **Quality Control**
+  - Includes the QC analysis added in `CondenScreenV2.Rmd`: per-plate QC summaries (nuclei counts, signal-to-background, Z' scores), plate heatmaps for controls, and Z' assay quality score 
+  - Flags rows, columns, well, and plates that have a statistically enriched hit rate that could be indications of technical biases. 
+  - Optionally filters the bottom 50-80% of low-expressing cells to reduce uninduced/non-transfected cells, and removes outlier image sets with strong artifacts.
+  - All QC flags and summary tables are exported alongside ranked hit lists to aid review and downstream decision-making.
  
  
 

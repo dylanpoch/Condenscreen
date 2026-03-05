@@ -16,6 +16,10 @@ The main notebook(s) perform the following high-level steps:
 6. Principal component clustering and UMAP projection + anchor-based similarity scoring.
 7. Visualization of results and saving trained model.
 
+### Saliency mapping
+
+The notebook also includes a saliency-mapping module (based on image integrated gradients) to help interpret model decisions. It computes heatmaps from the ResNet18 feature maps and overlays them on single-cell frames to highlight regions that most influence classification or similarity scores. The code provides functions to generate and save visual heatmap overlays for individual cells or batches. Required packages: `torch`, `torchvision`. Outputs are PNG overlays and example notebook cells demonstrating usage.
+
 ## Primary files
 - `*.ipynb` — Notebook(s) implementing the analysis (open these with Jupyter).
 - similarity_model_best.pt contains the trained model

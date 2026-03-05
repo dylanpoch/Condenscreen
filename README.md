@@ -15,9 +15,13 @@ This repository includes:
 - A **Bash script** to batch-process image sets across a computing cluster (in this case Yale's YCRC)
 - An **R script** for statistical analysis of foci, cell count, and screen-wide normalization using Z-, B-, and BZ-scores, depending on indication.
 - A trained supervised machine learning approach to characterize distinct condensate phenotypes from microscopy data
+   - The CondensateML notebook also includes a saliency-mapping module that generates heatmap overlays on single-cell images to highlight regions that most influence model predictions and aid interpretation.
 - A Graphical User Interface allowing well-selection and automated code alterations depending on if screen had a signal-ON vs signal-OFF readout.
 - Tools for hit identification & automated data visualization output.
-
+   - Quality Control (QC) measures are applied at multiple stages (image-segmentation quality checks, per-plate normalization, and replicate-consistency metrics) and QC flags are summarized in output reports to help users assess data reliability.
+   
+   - The pipeline also includes chemical triage filtering for small-molecule screens (PAINS and other reactive/promiscuous substructure filters) to flag likely false positives; filtered and flagged compounds are included in output tables to help prioritize high-confidence candidates for follow-up validation.
+  
 Originally developed to analyze MLF2-GFP foci, the pipeline can be adapted for other foci types and imaging setups.
 
 ---
