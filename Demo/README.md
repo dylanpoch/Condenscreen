@@ -23,7 +23,7 @@ The CondenScreen pipeline consists of three main steps:
 ### Run CellProfiler Pipeline
 
 1. Open **CellProfiler** on your system
-2. Load the pipeline file: `CondenScreenDemo.cpproj`
+2. Load the pipeline file: `CondenScreen.cpproj`
 3. Configure the input and output directories:
    - **Input Directory**: Drag and drop images into "Images" tab of CondenScreenDemo
    - **Output Directory**: Create and point to a new output folder (e.g., `ProcessedData/`)
@@ -38,7 +38,7 @@ The CondenScreen pipeline consists of three main steps:
 
 ### Configure Well Selection in the GUI
 
-The `CondenScreenDemo.Rmd` file includes an interactive GUI for well plate configuration:
+The `CondenScreenV2Demo.Rmd` file includes an interactive GUI for well plate configuration:
 
 1. Open the RMarkdown file in RStudio
 2. In the **CondenScreen Well Selection GUI**, configure the following:
@@ -64,7 +64,7 @@ After configuring wells in the GUI:
 
 ### Prepare Metadata
 
-1. Review `DemoMetadata.xlsx` - this file contains plate metadata and experimental conditions
+1. Review `plateMap.xlsx` - this file contains plate metadata and experimental conditions
 2. Import this file into your R environment as instructed in the analysis script
 
 ### Run the R Analysis Script
@@ -72,7 +72,7 @@ After configuring wells in the GUI:
 1. Open `process_batch.R` in RStudio
 2. **Update all file paths** to match your system:
    - Path to CellProfiler output CSV files
-   - Path to `DemoMetadata.xlsx`
+   - Path to `plateMap.xlsx`
    - Path to `well_selection.csv` (saved from the GUI)
    - Output directory for results
 3. Run the script line by line or source the entire file

@@ -1,5 +1,5 @@
 
-# Condenscreen v1.1
+# Condenscreen v1.2
 
 ## Instructions and Details of the main CondenScreen pipeline:
 
@@ -75,9 +75,9 @@ The **CondenScreen** R pipeline includes:
 
 ```
 CPBatch.sh               # Bash script to run CellProfiler on a SLURM cluster
-CondenScreen.Rmd         # Main R markdown script for data analysis and hit calling
-CondenScreen_CP.cpproj   # RStudio project file
-process_batch.R          # Helper script required by CondenScreen.Rmd
+CondenScreenV2.Rmd       # Main R markdown script for data analysis and hit calling
+CondenScreen.cpproj      # CellProfiler project file
+process_batch.R          # Helper script required by CondenScreenV2.Rmd
 ```
 
 ---
@@ -99,7 +99,7 @@ process_batch.R          # Helper script required by CondenScreen.Rmd
 Download the files listed above into a working directory. Alternatively, clone this repository via:
 
 ```bash
-git clone https://github.com/your-username/CondenScreen.git
+git clone https://github.com/dylanpoch/Condenscreen-v1.2.git
 ```
 
 ---
@@ -126,7 +126,7 @@ git clone https://github.com/your-username/CondenScreen.git
 
 ### 4. Analyze Results in R
 
-- Open `CondenScreen.Rmd` in RStudio
+- Open `CondenScreenV2.Rmd` in RStudio
 - Ensure `process_batch.R` is located in the same folder
 
 #### First-Time Setup:

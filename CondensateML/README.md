@@ -23,6 +23,8 @@ The main notebook(s) perform the following high-level steps:
 
 ## Key Python dependencies (minimal, annotate and pin versions locally)
 - python 3.8+
+- torch
+- torchvision
 - numpy
 - pandas
 - scikit-learn
@@ -40,7 +42,7 @@ conda [or pip] install <X_dependency>
 
 ## Expected runtime
 - *Highly* recommended to have GPU access in order to complete image processing and model training.
-- With modest GPU (> GeForce RTX 2070 or equivlent) a small test set of < 1k TIF images can be completed in under 1 hour. 
+- With modest GPU (> GeForce RTX 2070 or equivalent) a small test set of < 1k TIF images can be completed in under 1 hour. 
 - Larger datasets or heavier feature extraction (especially image-based) can take longer; runtime will vary by CPU/GPU and dataset size. The repository was tested Windows 10 (Ryzen 7 2700X, 64 GB).
 
 ## License
