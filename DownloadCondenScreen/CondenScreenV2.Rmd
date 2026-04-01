@@ -313,12 +313,7 @@ server <- function(input, output, session) {
 # Run app
 shinyApp(ui = ui, server = server)
 
-df22 <- fread(paste0(save_Location, "CondenScreenCombined_CondenScreen_Batch_29.csv"), skip = 1)
-head(df22)
-Plate_12004
-
-Plate_11679
-Plate_11680
+fread("/Users/dylan/Downloads/chemdiver/CondenScreenCombined_CondenScreen_Batch_2.csv")
 ```
 
 
@@ -676,7 +671,141 @@ temp_stats_Df <- temp_stats_Df %>%
 
 ```
 
+```{r}
+temp_stats_Df[order(temp_stats_Df$PercentChange, decreasing = TRUE),] 
+```
 
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+
+# --- Load & subset ---
+df <- read.xlsx("/Users/dylan/Documents/chemical_screen/results/CondenScreenV2.xlsx")
+df <- df[, c("BZScore", "PercentEffect", "tdTomato_Diff")]
+
+# --- Classify wells ---
+df <- df %>%
+  mutate(
+    tdTomato_outlier = abs(tdTomato_Diff) > 50,
+    hit_class = case_when(
+      tdTomato_outlier                                  ~ "tdTomato outlier",
+      PercentEffect > 25 & tdTomato_Diff > -12.5       ~ "Confirmed hit",
+      PercentEffect > 25 & tdTomato_Diff <= -12.5      ~ "Suspect — co-suppressed",
+      PercentEffect <= 25 & tdTomato_Diff <= -12.5     ~ "tdTomato suppressed only",
+      TRUE                                              ~ "Inactive"
+    ),
+    hit_class = factor(hit_class, levels = c(
+      "Confirmed hit", "Suspect — co-suppressed",
+      "tdTomato suppressed only", "Inactive", "tdTomato outlier"
+    ))
+  )
+
+# --- Color palette (shared) ---
+hit_colors <- c(
+  "Confirmed hit"            = "steelblue",
+  "Suspect — co-suppressed"  = "tomato",
+  "tdTomato suppressed only" = "goldenrod",
+  "Inactive"                 = "gray70",
+  "tdTomato outlier"         = "black"
+)
+
+# --- P1: PercentEffect quadrant ---
+p1 <- ggplot(df, aes(x = tdTomato_Diff, y = PercentEffect, color = hit_class)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = hit_colors) +
+  geom_hline(yintercept = 25,    linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = -12.5, linetype = "dashed", color = "gray40") +
+  annotate("text", x = 15,  y = 95, label = "Confirmed hits",         color = "steelblue", size = 3) +
+  annotate("text", x = -40, y = 95, label = "Suspect / co-suppressed",color = "tomato",    size = 3) +
+  labs(x = "tdTomato % Diff", y = "MLF2-GFP % Effect", 
+       color = "Hit class", title = "Quadrant: PercentEffect") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+
+# --- P2: BZScore quadrant ---
+p2 <- ggplot(df, aes(x = tdTomato_Diff, y = BZScore, color = hit_class)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = hit_colors) +
+  geom_hline(yintercept = 2.5,   linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = -12.5, linetype = "dashed", color = "gray40") +
+  annotate("text", x = 15,  y = max(df$BZScore, na.rm = TRUE) * 0.95,
+           label = "Confirmed hits",          color = "steelblue", size = 3) +
+  annotate("text", x = -40, y = max(df$BZScore, na.rm = TRUE) * 0.95,
+           label = "Suspect / co-suppressed", color = "tomato",    size = 3) +
+  labs(x = "tdTomato % Diff", y = "BZScore",
+       color = "Hit class", title = "Quadrant: BZScore") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+
+# --- P3: BZScore violin by class ---
+p3 <- ggplot(df, aes(x = hit_class, y = BZScore, fill = hit_class)) +
+  geom_violin(alpha = 0.7, trim = TRUE) +
+  geom_boxplot(width = 0.15, fill = "white", outlier.size = 0.5) +
+  scale_fill_manual(values = hit_colors) +
+  geom_hline(yintercept = 2.5, linetype = "dashed", color = "gray40") +
+  labs(x = NULL, y = "BZScore", title = "BZScore by hit class") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 25, hjust = 1))
+
+# --- Residual model within suspect cluster ---
+suspects <- df %>%
+  filter(hit_class == "Suspect — co-suppressed")
+
+suspect_model <- lm(PercentEffect ~ tdTomato_Diff, data = suspects)
+summary(suspect_model)
+
+suspects <- suspects %>%
+  mutate(
+    fitted       = fitted(suspect_model),
+    residual     = residuals(suspect_model),
+    residual_hit = residual > 13  # 1 RSE cutoff
+  )
+
+# --- P4: Residual rescue plot ---
+p4 <- ggplot(suspects, aes(x = tdTomato_Diff, y = PercentEffect)) +
+  geom_segment(aes(xend = tdTomato_Diff, yend = fitted),
+               color = "gray60", alpha = 0.4, linewidth = 0.4) +
+  geom_point(aes(color = residual_hit), size = 2.5, alpha = 0.8) +
+  geom_smooth(method = "lm", color = "gray30", se = TRUE, linetype = "dashed") +
+  scale_color_manual(values = c("FALSE" = "tomato", "TRUE" = "steelblue"),
+                     labels = c("FALSE" = "Suspect", "TRUE" = "Residual-rescued")) +
+  labs(
+    x        = "tdTomato % Diff",
+    y        = "MLF2-GFP % Effect",
+    color    = NULL,
+    title    = "Residual rescue within suspect cluster",
+    subtitle = paste0("R² = ", round(summary(suspect_model)$r.squared, 2),
+                      "  |  slope = ", round(coef(suspect_model)[2], 2),
+                      "  |  n = ", nrow(suspects))
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+
+# --- Print rescued hits ranked by residual ---
+suspects %>%
+  arrange(desc(residual)) %>%
+  select(BZScore, PercentEffect, tdTomato_Diff, residual) %>%
+  print()
+
+# --- Layout ---
+library(patchwork)
+(p1 | p2) / (p3 | p4)
+
+
+suspects <- suspects %>%
+  mutate(
+    fitted       = fitted(suspect_model),
+    residual     = residuals(suspect_model),
+    residual_rank = rank(-residual),
+    residual_hit  = residual_rank <= 5  # top N, adjust as needed
+  )
+
+table(df$hit_class)
+summary(suspect_model)
+```
 
 ```{r}
 # B-SCORE CALCULATION (CONTROLS FOR POSITIONAL EFFECTS) 
@@ -1042,6 +1171,12 @@ freezePane(wb, "Plate Statistics", firstActiveRow = 2)
 freezePane(wb, "Controls", firstActiveRow = 2)
 
 saveWorkbook(wb, file = export_File, overwrite = TRUE)
+
+
+```
+
+```{r}
+
 ```
 
 
