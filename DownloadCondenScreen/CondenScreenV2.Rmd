@@ -312,6 +312,13 @@ server <- function(input, output, session) {
 
 # Run app
 shinyApp(ui = ui, server = server)
+
+df22 <- fread(paste0(save_Location, "CondenScreenCombined_CondenScreen_Batch_29.csv"), skip = 1)
+head(df22)
+Plate_12004
+
+Plate_11679
+Plate_11680
 ```
 
 
@@ -320,7 +327,7 @@ shinyApp(ui = ui, server = server)
 #############################################################  
 #Make sure all pathways use foward slash (/)!
 #save_Location <- "/home/userX/pathsource/"
-save_Location <-"/home/userX/pathsource/"
+save_Location <-"/Users/dylan/Downloads/chemdiver/"
 file_Location<- save_Location
 #############################################################
 
@@ -356,7 +363,7 @@ ChemVGene <- dfSelection$ScreenType[1]
 #############################################################
 
 #file_paths <- dir(file_Location, pattern = "*.FociQuant.*", full.names = TRUE, recursive = TRUE)
-file_paths <- list.files(file_Location, pattern="pharmakon", full.names=TRUE, recursive=TRUE, ignore.case=TRUE)
+file_paths <- list.files(file_Location, pattern="CondenScreenCombined", full.names=TRUE, recursive=TRUE, ignore.case=TRUE)
 
 #############################################################
 
@@ -431,13 +438,13 @@ ensure_numeric <- function(DT, col) {
   invisible(NULL)
 }
 
-ensure_numeric(combined_data, "Intensity_IntegratedIntensity_tdTomato")
-ensure_numeric(combined_data, "AreaShape_Area")
+ensure_numeric(combined_data, "Intensity_IntegratedIntensity_P2A_tdTomato")
+ensure_numeric(combined_data, "AreaShape_Area_P2A_tdTomato")
 
-has_td_int  <- "Intensity_IntegratedIntensity_tdTomato" %in% names(combined_data) &&
-               any(!is.na(combined_data$Intensity_IntegratedIntensity_tdTomato))
-has_td_area <- "AreaShape_Area" %in% names(combined_data) &&
-               any(!is.na(combined_data$AreaShape_Area))
+has_td_int  <- "Intensity_IntegratedIntensity_P2A_tdTomato" %in% names(combined_data) &&
+               any(!is.na(combined_data$Intensity_IntegratedIntensity_P2A_tdTomato))
+has_td_area <- "AreaShape_Area_P2A_tdTomato_P2A_tdTomato" %in% names(combined_data) &&
+               any(!is.na(combined_data$AreaShape_Area_P2A_tdTomato_P2A_tdTomato))
 
 has_td <- has_td_int || has_td_area
 
@@ -518,21 +525,24 @@ combined_Df <- combined_Df %>%
   filter(complete.cases(Condition))
 
 #Calculate aggregate statistics for each condition:
-#Calculate aggregate statistics for each condition:
 combined_Df <- combined_Df %>%
   group_by(plate_Num, Well_Num) %>%
-  # Filter out top image in case of screen aberration
-  mutate(
-    n_images = n_distinct(ImageNumber),
-    summary_condition = if_else(n_images >= 8 & mean_Nuc_Foci > 1, mean_Nuc_Foci < max(mean_Nuc_Foci), TRUE)
-  ) %>%
-  filter(summary_condition) %>%
+  
+  # OPTIONAL [Filter out top image in case of screen aberration]
+  #----------
+  # mutate(
+  #   n_images = n_distinct(ImageNumber),
+  #   summary_condition = if_else(n_images >= 8 & mean_Nuc_Foci > 1, mean_Nuc_Foci < max(mean_Nuc_Foci), TRUE)
+  # ) %>%
+  #filter(summary_condition) %>%
+  #----------
+
   summarise(
     Nuclei_Number = mean(Nuclei_Number, na.rm = TRUE),
     Avg_Foci      = mean(mean_Nuc_Foci, na.rm = TRUE),
     
-    tdTomato_Area = if (has_td_area) mean(AreaShape_Area, na.rm = TRUE) else NA_real_,
-    tdTomato      = if (has_td_int)  mean(Intensity_IntegratedIntensity_tdTomato, na.rm = TRUE) else NA_real_,
+    tdTomato_Area = if (has_td_area) mean(AreaShape_Area_P2A_tdTomato, na.rm = TRUE) else NA_real_,
+    tdTomato      = if (has_td_int)  mean(Intensity_IntegratedIntensity_P2A_tdTomato, na.rm = TRUE) else NA_real_,
     
     AssayType  = unique(SignalStatus),
     Condition  = unique(Condition),
@@ -608,7 +618,6 @@ ctrls <- rbind(p_ctrls, n_ctrls)
 
 #Combined main dataframe: 
 combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")], by = "plate_Num" )
-
 
 
   
