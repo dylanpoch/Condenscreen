@@ -507,6 +507,7 @@ combined_Df <- combined_Df %>%
   mutate(
     Nuclei_Number = n(),
     mean_Nuc_Foci = mean(Children_GFP_foci_Count, na.rm = TRUE)
+    
   ) %>%
   
   ungroup()
@@ -633,24 +634,24 @@ combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")
   
   # Calculate percent change relative to plate
   mutate(
-    PercentChange = ifelse(
+    PercentEffect = ifelse(
       `AssayType` == "OFF",
       ((mean(Avg_Foci) - Avg_Foci) / mean(Avg_Foci)) * 100,
       ((Avg_Foci - mean(Avg_Foci)) / mean(Avg_Foci)) * 100
     ),
     
-    # Calculate the mean and standard deviation of each plate (based on PercentChange)
-    mean_percentEffect = mean(PercentChange),
-    SD_percentEffect = sd(PercentChange),
+    # Calculate the mean and standard deviation of each plate (based on PercentEffect)
+    mean_percentEffect = mean(PercentEffect),
+    SD_percentEffect = sd(PercentEffect),
   
     # Calculate Z-scores for test conditions specific to each plate
-    ZScore = (PercentChange - mean_percentEffect) / SD_percentEffect,
+    ZScore = (PercentEffect - mean_percentEffect) / SD_percentEffect,
   
     # Calculate normalized differences for nuclear area, form factor, and cell count
     #NuclearAreaDiff = (tdTomato - mean(tdTomato)) / mean(tdTomato) * 100,
     tdTomato_Diff = (tdTomato - mean(tdTomato)) / mean(tdTomato) * 100,
     CellCountDiff = (Nuclei_Number - mean(Nuclei_Number)) / mean(Nuclei_Number) * 100
-  )
+    )
 
 #Remove any duplicated columns up till now 
 
@@ -672,139 +673,171 @@ temp_stats_Df <- temp_stats_Df %>%
 ```
 
 ```{r}
-temp_stats_Df[order(temp_stats_Df$PercentChange, decreasing = TRUE),] 
+temp_stats_Df[order(temp_stats_Df$PercentEffect, decreasing = TRUE),] 
+
+colnames(temp_stats_Df)
 ```
 
 ```{r}
-
-library(dplyr)
-library(ggplot2)
-library(openxlsx)
-
-# --- Load & subset ---
-df <- read.xlsx("/Users/dylan/Documents/chemical_screen/results/CondenScreenV2.xlsx")
-df <- df[, c("BZScore", "PercentEffect", "tdTomato_Diff")]
-
-# --- Classify wells ---
-df <- df %>%
-  mutate(
-    tdTomato_outlier = abs(tdTomato_Diff) > 50,
-    hit_class = case_when(
-      tdTomato_outlier                                  ~ "tdTomato outlier",
-      PercentEffect > 25 & tdTomato_Diff > -12.5       ~ "Confirmed hit",
-      PercentEffect > 25 & tdTomato_Diff <= -12.5      ~ "Suspect — co-suppressed",
-      PercentEffect <= 25 & tdTomato_Diff <= -12.5     ~ "tdTomato suppressed only",
-      TRUE                                              ~ "Inactive"
-    ),
-    hit_class = factor(hit_class, levels = c(
-      "Confirmed hit", "Suspect — co-suppressed",
-      "tdTomato suppressed only", "Inactive", "tdTomato outlier"
-    ))
+if ("tdTomato_Diff" %in% names(temp_stats_Df)) {
+  
+  library(patchwork)
+  
+  # --- Create output directory FIRST ---
+  out_dir <- paste0(save_Location, "residuals/")
+  dir.create(out_dir, showWarnings = FALSE)
+  
+  # --- Classify wells ---
+  tdTomato_Df <- temp_stats_Df %>%
+    ungroup() %>%
+    mutate(
+      tdTomato_outlier = abs(tdTomato_Diff) > 50,
+      hit_class = case_when(
+        tdTomato_outlier                               ~ "tdTomato outlier",
+        PercentEffect > 20 & tdTomato_Diff > -10      ~ "Confirmed hit",
+        PercentEffect > 20 & tdTomato_Diff <= -10     ~ "Suspect — co-suppressed",
+        PercentEffect <= 20 & tdTomato_Diff <= -10    ~ "tdTomato suppressed only",
+        TRUE                                           ~ "Inactive"
+      ),
+      hit_class = factor(hit_class, levels = c(
+        "Confirmed hit", "Suspect — co-suppressed",
+        "tdTomato suppressed only", "Inactive", "tdTomato outlier"
+      ))
+    )
+  
+  # --- Color palette ---
+  hit_colors <- c(
+    "Confirmed hit"            = "steelblue",
+    "Suspect — co-suppressed"  = "tomato",
+    "tdTomato suppressed only" = "goldenrod",
+    "Inactive"                 = "gray70",
+    "tdTomato outlier"         = "black"
   )
+  
+  # --- P1: PercentEffect quadrant ---
+  y_max <- max(tdTomato_Df$PercentEffect, na.rm = TRUE)
+  y_min <- min(tdTomato_Df$PercentEffect, na.rm = TRUE)
+  
+  p1 <- ggplot(tdTomato_Df, aes(x = tdTomato_Diff, y = PercentEffect, color = hit_class)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    scale_color_manual(values = hit_colors) +
+    coord_cartesian(xlim = c(-50, 50), ylim = c(y_min, y_max)) +
+    geom_hline(yintercept = 20,  linetype = "dashed", color = "gray40") +
+    geom_vline(xintercept = -10, linetype = "dashed", color = "gray40") +
+    annotate("text", x = -49, y = y_max * 0.95,
+             label = "Suspect / co-suppressed", color = "tomato",    size = 3, hjust = 0) +
+    annotate("text", x = -5,  y = y_max * 0.95,
+             label = "Confirmed hits",          color = "steelblue", size = 3, hjust = 0) +
+    labs(
+      x     = "tdTomato % Diff (negative = non-specific suppression)",
+      y     = "MLF2-GFP % Effect (positive = fewer foci)",
+      color = "Hit class",
+      title = "Quadrant: PercentEffect vs. tdTomato"
+    ) +
+    theme_bw(base_size = 12) +
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+    theme(
+      legend.position = "bottom",
+      legend.text     = element_text(size = 9),
+      legend.key.size = unit(0.4, "cm")
+    )
+  
+  # --- Residual model ---
+  suspects <- tdTomato_Df %>%
+    filter(hit_class == "Suspect — co-suppressed") %>%
+    ungroup()
+  
+  suspect_model <- lm(PercentEffect ~ tdTomato_Diff, data = suspects)
+  model_summary <- summary(suspect_model)
+  
+  residual_threshold <- median(suspects$residual, na.rm = TRUE) + 
+                        1.5 * mad(suspects$residual,  na.rm = TRUE)
+  
+  # --- Mutate residuals BEFORE sink ---
+  suspects <- suspects %>%
+    mutate(
+      fitted        = fitted(suspect_model),
+      residual      = residuals(suspect_model),
+      residual_rank = rank(-residual),
+      residual_hit  = residual >= 20
+    )
+  
+  # --- Save model summary (now has residual info) ---
+  sink(file.path(out_dir, "suspect_model_summary.txt"))
+  cat("=== Suspect Cluster Regression Model ===\n\n")
+  cat("Formula: PercentEffect ~ tdTomato_Diff\n")
+  cat("Subset: hit_class == 'Suspect — co-suppressed'\n\n")
+  print(model_summary)
+  cat("\n=== Model Performance ===\n")
+  cat("R-squared:         ", round(model_summary$r.squared,     3), "\n")
+  cat("Adjusted R-squared:", round(model_summary$adj.r.squared, 3), "\n")
+  cat("Residual Std Error:", round(model_summary$sigma,         3), "\n")
+  cat("\n=== Residual Threshold ===\n")
+  cat("Method: residual >= 20\n")
+  cat("Rescued hits:", sum(suspects$residual_hit), "\n")
+  cat("Total suspects:", nrow(suspects), "\n")
+  sink()
+  
+  # --- P2: Residual rescue plot ---
+  p2 <- ggplot(suspects, aes(x = tdTomato_Diff, y = PercentEffect)) +
+    geom_segment(aes(xend = tdTomato_Diff, yend = fitted),
+                 color = "gray60", alpha = 0.4, linewidth = 0.4) +
+    geom_point(aes(color = residual_hit), size = 2.5, alpha = 0.8) +
+    geom_smooth(method = "lm", color = "gray30", se = TRUE, linetype = "dashed") +
+    scale_color_manual(values = c("FALSE" = "tomato", "TRUE" = "steelblue"),
+                       labels = c("FALSE" = "Suspect", "TRUE" = "Residual-rescued")) +
+    labs(
+      x        = "tdTomato % Diff",
+      y        = "MLF2-GFP % Effect",
+      color    = NULL,
+      title    = "Residual rescue within suspect cluster",
+      subtitle = paste0("R² = ",    round(model_summary$r.squared, 2),
+                        "  |  Adj R² = ", round(model_summary$adj.r.squared, 2),
+                        "  |  slope = ", round(coef(suspect_model)[2], 2),
+                        "  |  n = ",    nrow(suspects))
+    ) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "bottom")
+  
+  # --- Combined layout ---
+  combined <- p1 / p2
+  print(combined)
+  
+  # --- Save figures ---
+  ggsave(file.path(out_dir, "p1_percenteffect_quadrant.png"), p1,       width = 10, height = 7,  dpi = 300)
+  ggsave(file.path(out_dir, "p2_residual_rescue.png"),        p2,       width = 10, height = 7,  dpi = 300)
+  ggsave(file.path(out_dir, "residual_plots.png"),            combined, width = 10, height = 14, dpi = 300)
+  
+  # --- Join residuals back to main df ---
+  cols_to_remove <- c("tdTomato_outlier", "hit_class", "fitted", 
+                      "residual_hit", "residual_rank", "GFP_residual", "hit_candidate")
+  
+  suspects2 <- suspects[suspects$residual >= 20, 
+                        !names(suspects) %in% cols_to_remove]
+  
+  temp_stats_Df <- temp_stats_Df %>%
+    left_join(suspects2 %>% select(plate_Num, Well_Num, residual),
+              by = c("plate_Num", "Well_Num"))
+  
+  # --- Save Excel ---
+  wb <- createWorkbook()
+  addWorksheet(wb, "All Wells")
+  writeData(wb, "All Wells", tdTomato_Df)
+  addWorksheet(wb, "Confirmed Hits")
+  writeData(wb, "Confirmed Hits", tdTomato_Df %>% 
+              filter(hit_class == "Confirmed hit") %>% 
+              arrange(desc(PercentEffect)))
+  addWorksheet(wb, "Residual Rescued")
+  writeData(wb, "Residual Rescued", suspects %>% 
+              filter(residual_hit) %>% 
+              arrange(desc(residual)))
+  addWorksheet(wb, "Suspects")
+  writeData(wb, "Suspects", suspects %>% arrange(desc(residual)))
+  saveWorkbook(wb, file.path(out_dir, "residual_analysis.xlsx"), overwrite = TRUE)
+  
+  cat("Residual analysis complete. Outputs saved to:", out_dir, "\n")
+}
 
-# --- Color palette (shared) ---
-hit_colors <- c(
-  "Confirmed hit"            = "steelblue",
-  "Suspect — co-suppressed"  = "tomato",
-  "tdTomato suppressed only" = "goldenrod",
-  "Inactive"                 = "gray70",
-  "tdTomato outlier"         = "black"
-)
-
-# --- P1: PercentEffect quadrant ---
-p1 <- ggplot(df, aes(x = tdTomato_Diff, y = PercentEffect, color = hit_class)) +
-  geom_point(alpha = 0.6, size = 1.5) +
-  scale_color_manual(values = hit_colors) +
-  geom_hline(yintercept = 25,    linetype = "dashed", color = "gray40") +
-  geom_vline(xintercept = -12.5, linetype = "dashed", color = "gray40") +
-  annotate("text", x = 15,  y = 95, label = "Confirmed hits",         color = "steelblue", size = 3) +
-  annotate("text", x = -40, y = 95, label = "Suspect / co-suppressed",color = "tomato",    size = 3) +
-  labs(x = "tdTomato % Diff", y = "MLF2-GFP % Effect", 
-       color = "Hit class", title = "Quadrant: PercentEffect") +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "bottom")
-
-# --- P2: BZScore quadrant ---
-p2 <- ggplot(df, aes(x = tdTomato_Diff, y = BZScore, color = hit_class)) +
-  geom_point(alpha = 0.6, size = 1.5) +
-  scale_color_manual(values = hit_colors) +
-  geom_hline(yintercept = 2.5,   linetype = "dashed", color = "gray40") +
-  geom_vline(xintercept = -12.5, linetype = "dashed", color = "gray40") +
-  annotate("text", x = 15,  y = max(df$BZScore, na.rm = TRUE) * 0.95,
-           label = "Confirmed hits",          color = "steelblue", size = 3) +
-  annotate("text", x = -40, y = max(df$BZScore, na.rm = TRUE) * 0.95,
-           label = "Suspect / co-suppressed", color = "tomato",    size = 3) +
-  labs(x = "tdTomato % Diff", y = "BZScore",
-       color = "Hit class", title = "Quadrant: BZScore") +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "bottom")
-
-# --- P3: BZScore violin by class ---
-p3 <- ggplot(df, aes(x = hit_class, y = BZScore, fill = hit_class)) +
-  geom_violin(alpha = 0.7, trim = TRUE) +
-  geom_boxplot(width = 0.15, fill = "white", outlier.size = 0.5) +
-  scale_fill_manual(values = hit_colors) +
-  geom_hline(yintercept = 2.5, linetype = "dashed", color = "gray40") +
-  labs(x = NULL, y = "BZScore", title = "BZScore by hit class") +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "none",
-        axis.text.x = element_text(angle = 25, hjust = 1))
-
-# --- Residual model within suspect cluster ---
-suspects <- df %>%
-  filter(hit_class == "Suspect — co-suppressed")
-
-suspect_model <- lm(PercentEffect ~ tdTomato_Diff, data = suspects)
-summary(suspect_model)
-
-suspects <- suspects %>%
-  mutate(
-    fitted       = fitted(suspect_model),
-    residual     = residuals(suspect_model),
-    residual_hit = residual > 13  # 1 RSE cutoff
-  )
-
-# --- P4: Residual rescue plot ---
-p4 <- ggplot(suspects, aes(x = tdTomato_Diff, y = PercentEffect)) +
-  geom_segment(aes(xend = tdTomato_Diff, yend = fitted),
-               color = "gray60", alpha = 0.4, linewidth = 0.4) +
-  geom_point(aes(color = residual_hit), size = 2.5, alpha = 0.8) +
-  geom_smooth(method = "lm", color = "gray30", se = TRUE, linetype = "dashed") +
-  scale_color_manual(values = c("FALSE" = "tomato", "TRUE" = "steelblue"),
-                     labels = c("FALSE" = "Suspect", "TRUE" = "Residual-rescued")) +
-  labs(
-    x        = "tdTomato % Diff",
-    y        = "MLF2-GFP % Effect",
-    color    = NULL,
-    title    = "Residual rescue within suspect cluster",
-    subtitle = paste0("R² = ", round(summary(suspect_model)$r.squared, 2),
-                      "  |  slope = ", round(coef(suspect_model)[2], 2),
-                      "  |  n = ", nrow(suspects))
-  ) +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "bottom")
-
-# --- Print rescued hits ranked by residual ---
-suspects %>%
-  arrange(desc(residual)) %>%
-  select(BZScore, PercentEffect, tdTomato_Diff, residual) %>%
-  print()
-
-# --- Layout ---
-library(patchwork)
-(p1 | p2) / (p3 | p4)
-
-
-suspects <- suspects %>%
-  mutate(
-    fitted       = fitted(suspect_model),
-    residual     = residuals(suspect_model),
-    residual_rank = rank(-residual),
-    residual_hit  = residual_rank <= 5  # top N, adjust as needed
-  )
-
-table(df$hit_class)
-summary(suspect_model)
 ```
 
 ```{r}
@@ -812,7 +845,7 @@ summary(suspect_model)
 #------------------------------------------------------------------------------
 
 BScore_func <- function(df, rows, cols,
-                        effect_col = "PercentChange",
+                        effect_col = "PercentEffect",
                         well_col   = "Well_Num") {
 
   temp_df <- df
@@ -1074,16 +1107,17 @@ if (!has_td_int) {
 combined_Df_out <- temp_stats_Df %>% filter(Condition == Well_Num)
 
 base_off <- c("BZScore", "Viability", "plate_Num", "Well_Num", "ZPrime_Score",
-              "PercentChange", "Avg_Foci", "CellCountDiff", "Nuclei_Number",
+              "PercentEffect", "Avg_Foci", "CellCountDiff", "Nuclei_Number",
               "ZScore", "BScore", "AssayType")
 
 base_on  <- c("ZScore", "Viability", "plate_Num", "Well_Num", "ZPrime_Score",
-              "PercentChange", "Avg_Foci", "CellCountDiff", "Nuclei_Number",
+              "PercentEffect", "Avg_Foci", "CellCountDiff", "Nuclei_Number",
               "AssayType")
 
 td_cols <- character(0)
 if (has_td_area) td_cols <- c(td_cols, "tdTomato_Area")
 if (has_td_int)  td_cols <- c(td_cols, "tdTomato", "tdTomato_Diff")
+if ("residual" %in% names(temp_stats_Df)) td_cols <- c(td_cols, "residual")  
 
 if (assayType == "OFF") {
   keep_cols <- intersect(c(base_off, td_cols), names(combined_Df_out))
@@ -1094,7 +1128,7 @@ if (assayType == "OFF") {
       Plate                = any_of("plate_Num"),
       Well                 = any_of("Well_Num"),
       PlateZPrimeScore     = any_of("ZPrime_Score"),
-      PercentEffect        = any_of("PercentChange"),
+      PercentEffect        = any_of("PercentEffect"),
       AvgFoci              = any_of("Avg_Foci"),
       CellCountPercentDiff = any_of("CellCountDiff"),
       CellCount            = any_of("Nuclei_Number")
@@ -1111,7 +1145,7 @@ if (assayType == "OFF") {
       Plate                = any_of("plate_Num"),
       Well                 = any_of("Well_Num"),
       PlateZPrimeScore     = any_of("ZPrime_Score"),
-      PercentEffect        = any_of("PercentChange"),
+      PercentEffect        = any_of("PercentEffect"),
       AvgFoci              = any_of("Avg_Foci"),
       CellCountPercentDiff = any_of("CellCountDiff"),
       CellCount            = any_of("Nuclei_Number")
@@ -1142,7 +1176,7 @@ td_cols_all <- c(
   "tdTomato_Area", "tdTomato", "tdTomato_Diff",
   "TdTomato_Area", "TdTomatoIntensity",
   "Pos_TdTomatoArea", "Neg_TdTomatoArea",
-  "Pos_TdTomatoIntensity", "Neg_TdTomatoIntensity"
+  "Pos_TdTomatoIntensity", "Neg_TdTomatoIntensity", "residual"
 )
 
 combined_Df_out <- drop_all_na_cols(combined_Df_out, td_cols_all)
@@ -1171,6 +1205,7 @@ freezePane(wb, "Plate Statistics", firstActiveRow = 2)
 freezePane(wb, "Controls", firstActiveRow = 2)
 
 saveWorkbook(wb, file = export_File, overwrite = TRUE)
+
 
 
 ```
@@ -2652,7 +2687,12 @@ df_final <- df_hits %>%
   select(-ends_with(".old")) %>%
   mutate(
     Viability = if ("Viability" %in% names(.)) Viability else NA_real_,
-    TdTomato  = if ("tdTomato_Diff" %in% names(.)) tdTomato_Diff <= -25 else FALSE,
+    TdTomato = if ("tdTomato_Diff" %in% names(.)) {
+    tdTomato_Diff <= -25 &
+      if ("residual" %in% names(.)) !is.na(residual) else TRUE
+      } else FALSE,
+
+
     Cytotoxic = !is.na(Viability) & (Viability <= -25),
 
     has_smiles = !is.na(SMILES_used) & nzchar(trimws(SMILES_used)),
