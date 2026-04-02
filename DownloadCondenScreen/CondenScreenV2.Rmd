@@ -535,6 +535,8 @@ combined_Df <- combined_Df %>%
 
   summarise(
     Nuclei_Number = mean(Nuclei_Number, na.rm = TRUE),
+    Nuclear_Area = mean(AreaShape_Area, na.rm = TRUE),
+    FormFactor = mean(AreaShape_FormFactor, na.rm = TRUE),
     Avg_Foci      = mean(mean_Nuc_Foci, na.rm = TRUE),
     
     tdTomato_Area = if (has_td_area) mean(AreaShape_Area_P2A_tdTomato, na.rm = TRUE) else NA_real_,
@@ -648,7 +650,8 @@ combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")
     ZScore = (PercentEffect - mean_percentEffect) / SD_percentEffect,
   
     # Calculate normalized differences for nuclear area, form factor, and cell count
-    #NuclearAreaDiff = (tdTomato - mean(tdTomato)) / mean(tdTomato) * 100,
+    NuclearAreaDiff = (Nuclear_Area - mean(Nuclear_Area)) / mean(Nuclear_Area) * 100,
+    FormFactorDiff = (FormFactor - mean(FormFactor)) / mean(FormFactor) * 100,
     tdTomato_Diff = (tdTomato - mean(tdTomato)) / mean(tdTomato) * 100,
     CellCountDiff = (Nuclei_Number - mean(Nuclei_Number)) / mean(Nuclei_Number) * 100
     )
@@ -657,18 +660,21 @@ combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")
 
 #OPTIONAL -- Can have a more detailed view on cytotoxicity based on cell count and nuclear health:
 #Ceullular Health Function (as function of cell density, nuclear area, and nuclear formfactor/morphological differences)
-# temp_stats_Df$Viability <- temp_stats_Df %>% group_by(plate_Num, Well_Num) %>%
-#   
-#   # summarize(Viability =
-#   #   CellCountDiff + ((100 + CellCountDiff) / 100) * mean(NuclearAreaDiff, tdTomato_Diff)) %>% 
-#   #    pull(Viability)
-#   summarize(Viability =
-#     CellCountDiff)
-
 temp_stats_Df <- temp_stats_Df %>%
-  ungroup() %>%
-  mutate(Viability = CellCountDiff)
+  group_by(plate_Num, Well_Num) %>%
+  mutate(Viability =
+    CellCountDiff + ((100 + CellCountDiff) / 100) * ((NuclearAreaDiff + FormFactorDiff) / 2)
+  ) %>%
+  ungroup()
 
+#Else:
+# temp_stats_Df <- temp_stats_Df %>%
+#   group_by(plate_Num, Well_Num) %>%
+#   mutate(Viability =
+#     CellCountDiff) %>%
+#   ungroup()
+
+temp_stats_Df %>% arrange(desc(NuclearAreaDiff))
 
 ```
 

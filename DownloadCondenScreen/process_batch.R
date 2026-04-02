@@ -24,11 +24,12 @@ desired_cols <- c(
   "ObjectNumber",
   "FileName_GFP",
   "AreaShape_Area",
+  "AreaShape_FormFactor",
   "Intensity_IntegratedIntensity_P2A_tdTomato",
   "Children_GFP_foci_Count"
 )
 
-numeric_optional <- c("AreaShape_Area", "Intensity_IntegratedIntensity_P2A_tdTomato")
+numeric_optional <- c("AreaShape_Area","AreaShape_FormFactor", "Intensity_IntegratedIntensity_P2A_tdTomato")
 
 batch_data <- lapply(batch_paths, function(path) {
   header_cols  <- names(fread(path, nrows = 0, skip = 1))
