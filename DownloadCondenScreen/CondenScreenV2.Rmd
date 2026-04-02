@@ -2123,8 +2123,6 @@ saveWorkbook(wb, file.path(out_dir, "HTS_QC_RESULTS.xlsx"), overwrite = TRUE)
 invisible(NULL)
 
 
-
-
 #Overwrite previous hits sheet in original workbook to add QC measures:
 
 sheet_hits <- "Hits"
@@ -2170,17 +2168,38 @@ saveWorkbook(wb, fileX, overwrite = TRUE)
 # Configuration
 # ============================================================
 #Path to previously exported datasheet.
-#save_Location <- "/home/userX/pathsource/"
-
-#If not previously defined:
-fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
+save_Location <- "/Users/dylan/Documents/chemical_screen/results"
 
 #Saves cached smiles, if available, to avoid re-querying PubChem/CACTUS
 CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
+
 # ============================================================
+
 # 1) Load and merge data
+#If not previously defined:
+fileX   <- "/Users/dylan/Documents/chemical_screen/results/CondenScreenV2.xlsx"
 #Note: the drug/gene/identifier must be name Reference (it automatically will be unless changed)
-df_merged <-  read.xlsx(fileX, sheet = "Hits") %>%
+
+# 1) Load and merge data + build hits sheet (if needed_)
+sheet_hits <- "Hits"
+wb <- loadWorkbook(fileX)  # must load before referencing names(wb)
+
+if (!sheet_hits %in% names(wb)) {
+  addWorksheet(wb, sheet_hits)
+}
+
+hits_df <- if (assayType == "OFF") {
+  read.xlsx(fileX, sheet = "Combined Analysis") %>% filter(BZScore >= 3)
+} else {
+  read.xlsx(fileX, sheet = "Combined Analysis") %>% filter(ZScore >= 3)
+}
+
+writeData(wb, sheet_hits, hits_df)
+saveWorkbook(wb, fileX, overwrite = TRUE)
+
+
+
+df_merged <-  hits_df %>%
   mutate(Reference = trimws(as.character(Reference)))
 
 #Determines if reference already has SMILES chemical string available
@@ -2797,5 +2816,239 @@ worksheetOrder(wb) <- match(new_order, names(wb))
 saveWorkbook(wb, fileX, overwrite = TRUE)
 
 ```
+
+```{r}
+library(reticulate)
+library(ggplot2)
+library(pheatmap)
+library(igraph)
+library(ggraph)
+library(umap)
+library(reshape2)
+library(dplyr)
+library(ggrepel)
+library(openxlsx)
+
+# RDKit imports
+rdkit       <- import("rdkit")
+Chem        <- rdkit$Chem
+AllChem     <- rdkit$Chem$AllChem
+DataStructs <- rdkit$DataStructs
+Draw        <- import("rdkit.Chem.Draw")
+MolDrawing  <- import("rdkit.Chem.Draw.rdMolDraw2D")
+
+# ── Output directory ───────────────────────────────────────────────────────────
+out_dir <- "/Users/dylan/Documents/chemical_screen/results"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+
+# ── Molecular Fingerprinting ───────────────────────────────────────────────────────────────
+fps <- lapply(df_final$SMILES, function(smi) {
+  mol <- Chem$MolFromSmiles(smi)
+  if (is.null(mol)) return(NULL)
+  AllChem$GetMorganFingerprintAsBitVect(mol, radius = 2L, nBits = 2048L)
+})
+valid <- !sapply(fps, is.null)
+fps   <- fps[valid]
+refs  <- df_final$Reference[valid]
+
+
+# ── Tanimoto similarity matrix ─────────────────────────────────────────────────
+n <- length(fps)
+sim_matrix <- matrix(0, n, n, dimnames = list(refs, refs))
+for (i in seq_len(n))
+  for (j in seq_len(n))
+    sim_matrix[i, j] <- DataStructs$TanimotoSimilarity(fps[[i]], fps[[j]])
+
+# ── Palette ────────────────────────────────────────────────────────────────────
+diverging_owp    <- colorRampPalette(c("#E87D3E", "#F5C9A0", "white", "#9B8EC4", "#3B2A6E"))(100)
+sequential_pdark <- colorRampPalette(c("#F5D0D8", "#C98BAA", "#7B3F7A", "#3A1050", "#0F0318"))(100)
+bar_fill         <- "darkgray"
+umap_colors <- c("NT Ctrl" = "#F4A8B0", "RNF26" = "#F5C89A", "ZNF335" = "#C8B8E0")
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+make_legend <- function(ref, hits_df) {
+  row <- hits_df %>% filter(Reference == ref)
+  paste0(ref, " | Effect:", sprintf("%.1f", row$PercentEffect),
+         " | td:", sprintf("%.1f", row$tdTomato_Diff))
+}
+strip_name <- function(mol) { mol$SetProp("_Name", ""); mol }
+
+opts <- MolDrawing$MolDrawOptions()
+opts$legendFontSize <- 22L
+opts$legendFraction <- 0.15
+opts$padding        <- 0.05
+
+# ── Mol objects ────────────────────────────────────────────────────────────────
+mols       <- lapply(df_final$SMILES, function(smi) Chem$MolFromSmiles(smi))
+valid_mol  <- !sapply(mols, is.null)
+mols_valid <- mols[valid_mol]
+refs_valid <- df_final$Reference[valid_mol]
+
+#------------------------
+#Figure Generation:
+#------------------------
+
+# ── IMAGE 1: Heatmap ───────────────────────────────────────────────────────────
+#Convert from similarity to distance matrix for heatmap clustering:
+tanimoto_dist <- as.dist(1 - sim_matrix)
+
+png(file.path(out_dir, "tanimoto_heatmap.png"), width = 1400, height = 1200, res = 150)
+pheatmap(sim_matrix,                        # still display the similarity values
+         clustering_distance_rows = tanimoto_dist,
+         clustering_distance_cols = tanimoto_dist,
+         clustering_method = "ward.D2",
+         color = diverging_owp)
+dev.off()
+
+# ── IMAGE 2: Similarity distribution ──────────────────────────────────────────
+sim_vals <- melt(sim_matrix) %>% filter(Var1 != Var2)
+p_dist <- ggplot(sim_vals, aes(x = value)) +
+  geom_histogram(bins = 50, fill = bar_fill, color = "white") +
+  geom_vline(xintercept = 0.4, linetype = "dashed", color = "#E87D3E") +
+  labs(title = "Pairwise Tanimoto Similarity Distribution",
+       x = "Tanimoto Similarity", y = "Count") +
+  theme_classic()
+ggsave(file.path(out_dir, "tanimoto_distribution.png"), p_dist, width = 8, height = 5, dpi = 150)
+
+# ── IMAGE 4: UMAP scatter ──────────────────────────────────────────────────────
+umap_config <- umap.defaults
+umap_config$metric      <- "euclidean"   # or use 1-sim_matrix and "precomputed"
+umap_config$n_neighbors <- 10            # reasonable for ~50-100 compounds
+umap_config$min_dist    <- 0.2
+umap_config$random_state <- 42
+
+dist_matrix <- 1 - sim_matrix
+umap_res <- umap(dist_matrix, config = umap_config)
+umap_df  <- data.frame(UMAP1 = umap_res$layout[, 1], UMAP2 = umap_res$layout[, 2],
+                       Reference = rownames(sim_matrix))
+p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, label = Reference)) +
+  geom_point(color = bar_fill, size = 2) +
+  geom_text_repel(size = 3) +
+  theme_classic() +
+  labs(title = "UMAP of Chemical Fingerprint Similarity")
+ggsave(file.path(out_dir, "umap_scatter.png"), p_umap, width = 8, height = 6, dpi = 150)
+
+# ── IMAGE 5: All hits structure grid ──────────────────────────────────────────
+legends_all <- sapply(refs_valid, make_legend, hits_df = df_merged)
+mols_clean  <- lapply(mols_valid, strip_name)
+img_bytes <- Draw$MolsToGridImage(mols_clean, molsPerRow = 6L, subImgSize = c(600L, 500L),
+                                  legends = as.list(unname(legends_all)),
+                                  drawOptions = opts, returnPNG = TRUE)
+writeBin(as.raw(img_bytes), file.path(out_dir, "hits_structures.png"))
+
+# ── Similarity-based clusters ──────────────────────────────────────────────────
+sim_long <- melt(sim_matrix) %>%
+  filter(Var1 != Var2, value > 0.4) %>%
+  mutate(Var1 = as.character(Var1), Var2 = as.character(Var2))
+g     <- graph_from_data_frame(sim_long, directed = FALSE,
+                               vertices = data.frame(name = refs_valid))
+comps <- components(g)
+component_df <- data.frame(Reference = names(comps$membership), Group = comps$membership) %>%
+  group_by(Group) %>% filter(n() > 1) %>% ungroup() %>% arrange(Group)
+cluster_summary <- component_df %>%
+  group_by(Group) %>%
+  summarize(n = n(), compounds = paste(Reference, collapse = ", "))
+
+# ── IMAGE 6: Grouped structure grid ───────────────────────────────────────────
+ordered_idx     <- match(component_df$Reference, refs_valid)
+mols_grouped    <- lapply(mols_valid[ordered_idx], strip_name)
+max_group_size  <- max(table(component_df$Group))
+legends_grouped <- sapply(component_df$Reference, make_legend, hits_df = df_merged)
+img_bytes <- Draw$MolsToGridImage(mols_grouped, molsPerRow = as.integer(max_group_size),
+                                  subImgSize = c(600L, 500L),
+                                  legends = as.list(unname(legends_grouped)),
+                                  drawOptions = opts, returnPNG = TRUE)
+writeBin(as.raw(img_bytes), file.path(out_dir, "hits_structures_grouped.png"))
+
+
+
+# ── EXCEL EXPORT ───────────────────────────────────────────────────────────────
+wb <- createWorkbook()
+
+header_style    <- createStyle(fontName = "Arial", fontSize = 11, fontColour = "white",
+                               fgFill = "#3B2A6E", halign = "center",
+                               textDecoration = "bold", border = "Bottom")
+cell_style      <- createStyle(fontName = "Arial", fontSize = 10, numFmt = "0.0000",
+                               halign = "center", border = "LeftRight", borderColour = "#CCCCCC")
+cell_style_text <- createStyle(fontName = "Arial", fontSize = 10, halign = "left")
+cell_style_num  <- createStyle(fontName = "Arial", fontSize = 10, numFmt = "0.0000", halign = "right")
+cell_style_int  <- createStyle(fontName = "Arial", fontSize = 10, numFmt = "0", halign = "center")
+
+# ── Sheet 1: Tanimoto Similarity Matrix ───────────────────────────────────────
+addWorksheet(wb, "Tanimoto Similarity")
+sim_df <- cbind(Reference = rownames(sim_matrix), as.data.frame(sim_matrix))
+rownames(sim_df) <- NULL
+writeData(wb, "Tanimoto Similarity", sim_df, startRow = 1, startCol = 1,
+          headerStyle = header_style, borders = "surrounding")
+n_rows <- nrow(sim_df); n_cols <- ncol(sim_df)
+conditionalFormatting(wb, "Tanimoto Similarity", cols = 2:n_cols, rows = 2:(n_rows + 1),
+                      style = c("#FFFFFF", "#7B3F7A"), rule = c(0, 1), type = "colourScale")
+addStyle(wb, "Tanimoto Similarity", style = cell_style,
+         rows = 2:(n_rows + 1), cols = 2:n_cols, gridExpand = TRUE)
+addStyle(wb, "Tanimoto Similarity", style = cell_style_text,
+         rows = 2:(n_rows + 1), cols = 1, gridExpand = TRUE)
+setColWidths(wb, "Tanimoto Similarity", cols = 1,
+             widths = max(nchar(as.character(sim_df$Reference))) * 1.2 + 2)
+setColWidths(wb, "Tanimoto Similarity", cols = 2:n_cols, widths = 10)
+freezePane(wb, "Tanimoto Similarity", firstRow = TRUE, firstCol = TRUE)
+
+# ── Sheet 2: UMAP Results ─────────────────────────────────────────────────────
+addWorksheet(wb, "UMAP Results")
+writeData(wb, "UMAP Results", umap_df, startRow = 1, startCol = 1,
+          headerStyle = header_style, borders = "surrounding")
+n_umap_rows <- nrow(umap_df)
+addStyle(wb, "UMAP Results", style = cell_style_text,
+         rows = 2:(n_umap_rows + 1), cols = 1, gridExpand = TRUE)
+addStyle(wb, "UMAP Results", style = cell_style_num,
+         rows = 2:(n_umap_rows + 1), cols = 2:3, gridExpand = TRUE)
+setColWidths(wb, "UMAP Results", cols = 1, widths = 25)
+setColWidths(wb, "UMAP Results", cols = 2:3, widths = 14)
+freezePane(wb, "UMAP Results", firstRow = TRUE, firstCol = FALSE)
+
+# ── Sheet 3: Cluster Assignments ───────────────────────────────────────────────
+addWorksheet(wb, "Clusters")
+cluster_export <- component_df %>%
+  left_join(df_merged %>% select(Reference, PercentEffect, tdTomato_Diff), by = "Reference") %>%
+  arrange(Group, Reference)
+cluster_export$Group <- as.integer(cluster_export$Group)
+writeData(wb, "Clusters", cluster_export, startRow = 1, startCol = 1,
+          headerStyle = header_style, borders = "surrounding")
+n_cluster_rows <- nrow(cluster_export)
+addStyle(wb, "Clusters", style = cell_style_text,
+         rows = 2:(n_cluster_rows + 1), cols = 1, gridExpand = TRUE)
+addStyle(wb, "Clusters", style = cell_style_int,
+         rows = 2:(n_cluster_rows + 1), cols = 2, gridExpand = TRUE)
+addStyle(wb, "Clusters", style = cell_style_num,
+         rows = 2:(n_cluster_rows + 1), cols = 3:4, gridExpand = TRUE)
+
+
+
+# Alternating row shading by cluster group
+groups <- cluster_export$Group
+for (i in seq_len(n_cluster_rows)) {
+  if (groups[i] %% 2 == 0)
+    addStyle(wb, "Clusters", rows = i + 1, cols = 1:4, gridExpand = TRUE, stack = TRUE,
+             style = createStyle(fgFill = "#EDE9F5", fontName = "Arial", fontSize = 10))
+}
+
+writeData(wb, "Clusters", cluster_summary, startRow = 1, startCol = 6,
+          headerStyle = header_style, borders = "surrounding")
+setColWidths(wb, "Clusters", cols = 1,   widths = 25)
+setColWidths(wb, "Clusters", cols = 2,   widths = 10)
+setColWidths(wb, "Clusters", cols = 3:4, widths = 16)
+setColWidths(wb, "Clusters", cols = 6:8, widths = c(10, 8, 40))
+freezePane(wb, "Clusters", firstRow = TRUE)
+
+# ── Save workbook ──────────────────────────────────────────────────────────────
+saveWorkbook(wb, file.path(out_dir, "cheminformatics_results.xlsx"), overwrite = TRUE)
+
+message("Export complete:")
+message("  Images: tanimoto_heatmap.png, tanimoto_distribution.png, pca_scatter.png,")
+message("          umap_scatter.png, hits_structures.png, hits_structures_grouped.png")
+message("  Excel:  cheminformatics_results.xlsx (3 sheets: Tanimoto Similarity, UMAP Results, Clusters)")
+
+```
+
 
 
