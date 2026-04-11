@@ -16,7 +16,9 @@ required_packages <- c("tidyverse", "knitr", "DBI", "ggpval", "openxlsx",
                        "EnvStats", "ggpubr", "psych", "plotrix", "BSDA",
                        "ggrepel", "data.table", "progress", "shiny", "plotly",
                        "htmltools", "sass", "rlang", "gridExtra", "ggplate",
-                       "writexl", "httr2", "reticulate", "jsonlite", "patchwork", "reticulate")
+                       "writexl", "httr2", "reticulate", "jsonlite", "patchwork", 
+                       "pheatmap", "igraph", "ggraph", "umap", "reshape2", "dplyr",
+                       "patchwork", "magick")
 
 
 installed <- rownames(installed.packages())
@@ -687,7 +689,6 @@ colnames(temp_stats_Df)
 ```{r}
 if ("tdTomato_Diff" %in% names(temp_stats_Df)) {
   
-  library(patchwork)
   
   # --- Create output directory FIRST ---
   out_dir <- paste0(save_Location, "residuals/")
@@ -2821,17 +2822,6 @@ saveWorkbook(wb, fileX, overwrite = TRUE)
 ```
 
 ```{r}
-library(reticulate)
-library(ggplot2)
-library(pheatmap)
-library(igraph)
-library(ggraph)
-library(umap)
-library(reshape2)
-library(dplyr)
-library(ggrepel)
-library(openxlsx)
-
 # RDKit imports
 rdkit       <- import("rdkit")
 Chem        <- rdkit$Chem
@@ -2841,12 +2831,12 @@ Draw        <- import("rdkit.Chem.Draw")
 MolDrawing  <- import("rdkit.Chem.Draw.rdMolDraw2D")
 
 # ── Output directory ───────────────────────────────────────────────────────────
-out_dir <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx" 
+out_dir <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/" 
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 
 # ── Molecular Fingerprinting ───────────────────────────────────────────────────────────────
-fps <- lapply(df_final$SMILES, function(smi) {
+fps <- lapply(df_final$SMILES_used, function(smi) {
   mol <- Chem$MolFromSmiles(smi)
   if (is.null(mol)) return(NULL)
   AllChem$GetMorganFingerprintAsBitVect(mol, radius = 2L, nBits = 2048L)
@@ -2883,7 +2873,7 @@ opts$legendFraction <- 0.15
 opts$padding        <- 0.05
 
 # ── Mol objects ────────────────────────────────────────────────────────────────
-mols       <- lapply(df_final$SMILES, function(smi) Chem$MolFromSmiles(smi))
+mols       <- lapply(df_final$SMILES_used, function(smi) Chem$MolFromSmiles(smi))
 valid_mol  <- !sapply(mols, is.null)
 mols_valid <- mols[valid_mol]
 refs_valid <- df_final$Reference[valid_mol]
@@ -2954,17 +2944,125 @@ cluster_summary <- component_df %>%
   summarize(n = n(), compounds = paste(Reference, collapse = ", "))
 
 # ── IMAGE 6: Grouped structure grid ───────────────────────────────────────────
-ordered_idx     <- match(component_df$Reference, refs_valid)
-mols_grouped    <- lapply(mols_valid[ordered_idx], strip_name)
-max_group_size  <- max(table(component_df$Group))
-legends_grouped <- sapply(component_df$Reference, make_legend, hits_df = df_merged)
-img_bytes <- Draw$MolsToGridImage(mols_grouped, molsPerRow = as.integer(max_group_size),
-                                  subImgSize = c(600L, 500L),
-                                  legends = as.list(unname(legends_grouped)),
-                                  drawOptions = opts, returnPNG = TRUE)
-writeBin(as.raw(img_bytes), file.path(out_dir, "hits_structures_grouped.png"))
+# ── IMAGE 6: One row per cluster, structures + text separated via magick ───────
+library(magick)
 
+groups_unique <- sort(unique(component_df$Group))
 
+cluster_images <- lapply(groups_unique, function(grp) {
+  
+  # ── Compounds in this cluster ────────────────────────────────────────────────
+  refs_in_grp <- component_df$Reference[component_df$Group == grp]
+  idx_in_grp  <- match(refs_in_grp, refs_valid)
+  valid_idx   <- !is.na(idx_in_grp)
+  refs_in_grp <- refs_in_grp[valid_idx]
+  idx_in_grp  <- idx_in_grp[valid_idx]
+  n_in_grp    <- length(refs_in_grp)
+  
+  # ── 1. Draw structures with no legend ───────────────────────────────────────
+  mols_grp     <- lapply(mols_valid[idx_in_grp], strip_name)
+  blank_legs   <- as.list(rep("", n_in_grp))
+  
+  struct_bytes <- Draw$MolsToGridImage(
+    mols_grp,
+    molsPerRow  = as.integer(n_in_grp),
+    subImgSize  = c(600L, 500L),
+    legends     = blank_legs,
+    drawOptions = opts,
+    returnPNG   = TRUE
+  )
+  struct_img <- image_read(as.raw(struct_bytes))
+  struct_w   <- image_info(struct_img)$width
+  cell_w     <- as.integer(struct_w / n_in_grp)
+  
+  # ── 2. Build text panel for each compound ───────────────────────────────────
+  text_panels <- lapply(seq_len(n_in_grp), function(i) {
+    ref <- refs_in_grp[i]
+    row <- df_merged %>% filter(Reference == ref)
+    
+    # Pairwise Tanimoto vs every other compound in cluster
+    others    <- setdiff(seq_len(n_in_grp), i)
+    tan_lines <- sapply(others, function(j) {
+      t_val <- DataStructs$TanimotoSimilarity(fps[[idx_in_grp[i]]], fps[[idx_in_grp[j]]])
+      sprintf("  vs %s:  %.2f", refs_in_grp[j], t_val)
+    })
+    
+    lines <- c(
+      ref,
+      sprintf("Eff: %.1f  |  td: %.1f", row$PercentEffect, row$tdTomato_Diff),
+      "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+      "Tanimoto:",
+      tan_lines
+    )
+    text_block <- paste(lines, collapse = "\n")
+    n_lines    <- length(lines)
+    panel_h    <- 30 + n_lines * 28
+    
+    image_blank(cell_w, panel_h, color = "white") %>%
+      image_annotate(
+        text     = text_block,
+        gravity  = "NorthWest",
+        location = "+20+12",
+        size     = 22,
+        color    = "#222222",
+        font     = "DejaVu-Sans"
+      )
+  })
+  
+  # ── 3. Stitch text panels side by side ──────────────────────────────────────
+  text_row <- image_append(do.call(c, text_panels), stack = FALSE)
+  
+  # Pad text row to match structure image width if needed
+  text_w <- image_info(text_row)$width
+  if (text_w < struct_w) {
+    text_row <- image_extent(
+      text_row,
+      geometry = paste0(struct_w, "x", image_info(text_row)$height),
+      gravity  = "West",
+      color    = "white"
+    )
+  }
+  
+  # ── 4. Stack structure image on top of text row ──────────────────────────────
+  image_append(c(struct_img, text_row), stack = TRUE)
+})
+
+# ── Add cluster banners and stack all rows vertically ────────────────────────
+max_width <- max(sapply(cluster_images, function(img) image_info(img)$width))
+
+final_rows <- lapply(seq_along(cluster_images), function(i) {
+  grp <- groups_unique[i]
+  n   <- sum(component_df$Group == grp)
+  img <- cluster_images[[i]]
+  
+  # Pad to uniform width
+  if (image_info(img)$width < max_width) {
+    img <- image_extent(
+      img,
+      geometry = paste0(max_width, "x", image_info(img)$height),
+      gravity  = "West",
+      color    = "white"
+    )
+  }
+  
+  # Cluster label banner
+  banner <- image_blank(max_width, 50, color = "#EDE9F5") %>%
+    image_annotate(
+      text     = sprintf("Cluster %d  (%d compounds)", grp, n),
+      gravity  = "West",
+      location = "+16+0",
+      size     = 26,
+      color    = "#3B2A6E",
+      font     = "DejaVu-Sans",
+      weight   = 700
+    )
+  
+  image_append(c(banner, img), stack = TRUE)
+})
+
+final_img <- image_append(do.call(c, final_rows), stack = TRUE)
+image_write(final_img, file.path(out_dir, "hits_structures_grouped.png"))
+message("Saved: hits_structures_grouped.png")
 
 # ── EXCEL EXPORT ───────────────────────────────────────────────────────────────
 wb <- createWorkbook()
@@ -3048,9 +3146,8 @@ saveWorkbook(wb, file.path(out_dir, "cheminformatics_results.xlsx"), overwrite =
 
 message("Export complete:")
 message("  Images: tanimoto_heatmap.png, tanimoto_distribution.png, pca_scatter.png,")
-message("          umap_scatter.png, hits_structures.png, hits_structures_grouped.png")
+message("umap_scatter.png, hits_structures.png, hits_structures_grouped.png")
 message("  Excel:  cheminformatics_results.xlsx (3 sheets: Tanimoto Similarity, UMAP Results, Clusters)")
-
 ```
 
 
