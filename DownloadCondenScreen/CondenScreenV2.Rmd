@@ -16,7 +16,7 @@ required_packages <- c("tidyverse", "knitr", "DBI", "ggpval", "openxlsx",
                        "EnvStats", "ggpubr", "psych", "plotrix", "BSDA",
                        "ggrepel", "data.table", "progress", "shiny", "plotly",
                        "htmltools", "sass", "rlang", "gridExtra", "ggplate",
-                       "writexl", "httr2", "reticulate", "jsonlite", "patchwork")
+                       "writexl", "httr2", "reticulate", "jsonlite", "patchwork", "reticulate")
 
 
 installed <- rownames(installed.packages())
@@ -1535,8 +1535,9 @@ normalized_dist <- normalized_dist +
 # 1. CONFIGURATION
 # ============================================================
 #If not previously defined:
-fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
-
+#fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
+file_Location <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/"
+fileX <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx"
 export_File <- fileX
 sheetX  <- "Combined Analysis"
 out_dir <- paste0(file_Location, "HTS_QC_OUT/")
@@ -2068,7 +2069,7 @@ hits_df_qc <- df %>%
     QC_alpha = alpha_qc
   ) %>%
   select(everything(), Systematic_error, Type_of_Error, QC_alpha) %>%
-  select(-any_of(c("Hit", "Hit", "QC_row_score", "QC_col_score", "QC_well_score",
+  select(-any_of(c("Hit", "QC_row_score", "QC_col_score", "QC_well_score",
                    "QC_row_hit", "QC_col_hit", "QC_well_hit", "QC_score_flag", "QC_hit_flag",
                    "Systematic_plate_error", "Systematic_error_type", "QC_score_metric_used")))
 
@@ -2168,7 +2169,7 @@ saveWorkbook(wb, fileX, overwrite = TRUE)
 # Configuration
 # ============================================================
 #Path to previously exported datasheet.
-save_Location <- "/Users/dylan/Documents/chemical_screen/results"
+save_Location <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/"
 
 #Saves cached smiles, if available, to avoid re-querying PubChem/CACTUS
 CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
@@ -2177,7 +2178,7 @@ CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
 
 # 1) Load and merge data
 #If not previously defined:
-fileX   <- "/Users/dylan/Documents/chemical_screen/results/CondenScreenV2.xlsx"
+fileX   <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx"
 #Note: the drug/gene/identifier must be name Reference (it automatically will be unless changed)
 
 # 1) Load and merge data + build hits sheet (if needed_)
@@ -2185,18 +2186,18 @@ sheet_hits <- "Hits"
 wb <- loadWorkbook(fileX)  # must load before referencing names(wb)
 
 if (!sheet_hits %in% names(wb)) {
+  # Build hits_df and write new sheet
+  hits_df <- if (assayType == "OFF") {
+    read.xlsx(fileX, sheet = "Combined Analysis") %>% filter(BZScore >= 3)
+  } else {
+    read.xlsx(fileX, sheet = "Combined Analysis") %>% filter(ZScore >= 3)
+  }
   addWorksheet(wb, sheet_hits)
-}
-
-hits_df <- if (assayType == "OFF") {
-  read.xlsx(fileX, sheet = "Combined Analysis") %>% filter(BZScore >= 3)
+  writeData(wb, sheet_hits, hits_df)
+  saveWorkbook(wb, fileX, overwrite = TRUE)
 } else {
-  read.xlsx(fileX, sheet = "Combined Analysis") %>% filter(ZScore >= 3)
+  hits_df <- read.xlsx(fileX, sheet = sheet_hits)
 }
-
-writeData(wb, sheet_hits, hits_df)
-saveWorkbook(wb, fileX, overwrite = TRUE)
-
 
 
 df_merged <-  hits_df %>%
@@ -2244,11 +2245,13 @@ cache_flush <- function() {
 }
 
 #Activate the RDKit Python environment
-use_condaenv("rdkit-env", required = TRUE)
-Chem    <- import("rdkit.Chem")
+conda_Path <- as.character(conda_list()[conda_list()$name == "rdkit-env", "python"])
+use_condaenv(conda_Path, required = TRUE)
+
+# Only then import
+Chem <- import("rdkit.Chem")
 RDLogger <- import("rdkit.RDLogger")
 RDLogger$DisableLog("rdApp.*")
-
 # ============================================================
 # 3) Identifier cleaning and SMILES retrieval
 # ============================================================
@@ -2764,18 +2767,15 @@ df_final <- df_final %>%
 
 #Select important columns for exporting:
 df_final <- df_final %>%
-  select(
-    Plate, Well, BZScore, Viability, PlateZPrimeScore,
-    PercentEffect, AvgFoci, CellCountPercentDiff, CellCount, ZScore,
-    BScore, AssayType, Average_foci_perCell, Normalized_Effect, Reference,
-    CAS,
-    Systematic_error, QC_alpha,
-    Risk, Lipinski, TdTomato, Cytotoxic,
-    MW, LogP, HBD, HBA,
-    Lipinski_Failed,
-    SMILES_used, AlertScore, alert_flags
-  )
-
+  select(any_of(c(
+    "Reference", "Plate", "Well",
+    "BZScore", "ZScore", "BScore", "PercentEffect",
+    "Viability", "Risk", "PlateZPrimeScore", "Systematic_error", "QC_alpha",
+    "AvgFoci", "Average_foci_perCell", "CellCount", "CellCountPercentDiff",
+    "AssayType", "TdTomato", "Cytotoxic",
+    "CAS", "SMILES_used", "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
+    "AlertScore", "alert_flags"
+  )))
 # ============================================================
 # 8) Write back to Excel
 # ============================================================
@@ -2815,6 +2815,9 @@ worksheetOrder(wb) <- match(new_order, names(wb))
 
 saveWorkbook(wb, fileX, overwrite = TRUE)
 
+
+
+
 ```
 
 ```{r}
@@ -2838,7 +2841,7 @@ Draw        <- import("rdkit.Chem.Draw")
 MolDrawing  <- import("rdkit.Chem.Draw.rdMolDraw2D")
 
 # ── Output directory ───────────────────────────────────────────────────────────
-out_dir <- "/Users/dylan/Documents/chemical_screen/results"
+out_dir <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx" 
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 
