@@ -1217,10 +1217,6 @@ saveWorkbook(wb, file = export_File, overwrite = TRUE)
 
 ```
 
-```{r}
-
-```
-
 
 ```{r}
 # ------------- SETUP AND CONFIGURATION -------------
@@ -1238,11 +1234,6 @@ wb <- loadWorkbook(export_File)
 
 merged_df <- read.xlsx(wb, sheet = "Combined Analysis")
 
-#Typically comment the following two lines out. Dataset Specific
-#merged_df <- merged_df[merged_df$Plate != "A19946", ]
-merged_df$Plate[merged_df$Plate == "READ"] <- "A19840"
-
-
 # Convert numeric columns to proper type
 merged_df$Average_foci_perCell <- as.numeric(merged_df$AvgFoci)
 merged_df$Normalized_Effect <- as.numeric(merged_df$PercentEffect)
@@ -1251,56 +1242,60 @@ merged_df <- merged_df[!as.character(merged_df$Plate) %in% c("45", "46", "47"), 
 #############################################################
 
 template_location <- file.path(file_Location, "plateMap.xlsx")
-template <- read.xlsx(template_location)
 
-well_candidates <- c("Well", "Well_Condition")
-ref_candidates  <- c("Reference", "Gene", "Compound")
-cas_candidates  <- c("CAS", "CAS.Number")
-smiles_candidates <- c("SMILES")
+template_exists <- file.exists(template_location)
 
-pick_first_existing <- function(df, candidates) {
-  intersect(candidates, colnames(df))[1]
+if (template_exists) {
+  template <- read.xlsx(template_location)
+  
+  well_candidates <- c("Well", "Well_Condition")
+  ref_candidates  <- c("Reference", "Gene", "Compound")
+  cas_candidates  <- c("CAS", "CAS.Number")
+  smiles_candidates <- c("SMILES")
+  
+  pick_first_existing <- function(df, candidates) {
+    intersect(candidates, colnames(df))[1]
+  }
+  
+  well_col   <- pick_first_existing(template, well_candidates)
+  ref_col    <- pick_first_existing(template, ref_candidates)
+  cas_col    <- pick_first_existing(template, cas_candidates)
+  smiles_col <- pick_first_existing(template, smiles_candidates)
+  
+  select_cols <- c(
+    intersect("Plate", colnames(template)),
+    well_col,
+    ref_col,
+    cas_col,
+    smiles_col
+  )
+  select_cols <- select_cols[!is.na(select_cols)]
+  
+  template <- template %>%
+    select(all_of(select_cols)) %>%
+    rename(
+      Well      = any_of(well_candidates),
+      Reference = any_of(ref_candidates),
+      CAS       = any_of(cas_candidates)
+    )
+   
+  # If no Reference/Gene/Compound column existed, add numbered Reference column
+  if (!"Reference" %in% colnames(template)) {
+    template$Reference <- seq_len(nrow(template))
+  }
+  
+  # Merge data with compound names
+  merged_df <- merge(merged_df, template, by = c("Plate", "Well"))
+  
+} else {
+  message("plateMap.xlsx not found at ", template_location, " — skipping template merge.")
+  
+  # Add numbered Reference column if none of the ref columns exist in merged_df
+  if (!any(c("Reference", "Gene", "Compound") %in% colnames(merged_df))) {
+    merged_df$Reference <- seq_len(nrow(merged_df))
+  }
 }
 
-well_col   <- pick_first_existing(template, well_candidates)
-ref_col    <- pick_first_existing(template, ref_candidates)
-cas_col    <- pick_first_existing(template, cas_candidates)
-smiles_col <- pick_first_existing(template, smiles_candidates)
-
-select_cols <- c(
-  intersect("Plate", colnames(template)),
-  well_col,
-  ref_col,
-  cas_col,
-  smiles_col
-)
-
-select_cols <- select_cols[!is.na(select_cols)]
-
-template <- template %>%
-  select(all_of(select_cols)) %>%
-  rename(
-    Well      = any_of(well_candidates),
-    Reference = any_of(ref_candidates),
-    CAS       = any_of(cas_candidates)
-  )
-# Merge data with compound names
- merged_df <- merge(merged_df, template, by = c("Plate", "Well"))
-
-#############################################################
-#If you do not have access to a file linking reference names to each well, uncomment and run below:
-
-#merged_df$Reference <- merged_df$Well
-
-#############################################################
-
-#-------------------------CHANGE IF NECESSARY----------------------------
-hits_of_interest <- c("PYRITHIONE ZINC", "CELASTROL", "PLUMBAGIN", "DISULFIRAM", "APOL3", "ZNF335", "RNF26", "RAN", "NUP
-                       50", "EIF4A3", "TOR1A", "TOR1B")
-microcephaly  <- c("ZNF335", "SIN3A", "SPDL1", "CDK5", "NCAPD3", "CIT", "SHH")
-#------------------------------------------------------------------------
-
-#############################################################
 
 sheet_hits = "Hits"
 sheet_df = "Combined Analysis"
@@ -1384,10 +1379,6 @@ plot_normalized_score <- function(df, assay_type, image_path) {
     # ---- BZ >= 3 hits, colored by phenotype logic
 geom_point(
   data = dplyr::filter(df, !!score_col >= 3),
-  aes(
-    color = Reference %in% hits_of_interest,
-    size  = Reference %in% hits_of_interest
-  ),
   alpha = 1
 ) +
 scale_size_manual(values  = c("TRUE" = 2.6, "FALSE" = 2)) +
@@ -1854,7 +1845,7 @@ saveWorkbook(wb, file.path(out_dir,"HTS_QC_RESULTS.xlsx"), overwrite=TRUE)
 invisible(NULL)
 
 ```
-
+)
 
 
 ```{r}
@@ -2411,9 +2402,9 @@ df_final <- df_hits %>%
     Viability = if ("Viability" %in% names(.)) Viability else NA_real_,
     TdTomato = if ("tdTomato_Diff" %in% names(.)) {
     tdTomato_Diff <= -25 &
-      if ("residual" %in% names(.)) !is.na(residual) else TRUE
-      } else FALSE,
-
+      if ("residual" %in% names(.)) is.na(residual) else TRUE
+  } else FALSE,
+    
 
     Cytotoxic = !is.na(Viability) & (Viability <= -25),
 
@@ -2466,7 +2457,7 @@ df_final <- df_final %>%
     "BZScore", "ZScore", "BScore", "PercentEffect",
     "Viability", "Risk", "PlateZPrimeScore", "Systematic_error", "QC_alpha",
     "AvgFoci", "Average_foci_perCell", "CellCount", "CellCountPercentDiff",
-    "AssayType", "TdTomato", "Cytotoxic",
+    "AssayType", "TdTomato", "residual", "Cytotoxic",
     "CAS", "SMILES_used", "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
     "AlertScore", "alert_flags"
   )))
