@@ -1544,10 +1544,13 @@ sheetX           <- "Combined Analysis"
 out_dir          <- paste0(file_Location, "HTS_QC_OUT/")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-hit_threshold    <- 2
-alpha_qc         <- 0.05
+#Update this value based on the Z-Score or BZ-Score threshold you are using for hit selection. 
+#If hit_threshold <- 2, then any well positions that are called as hits if Z or BZ-Score >= 2. 
+hit_threshold <- 2
+#QC threshold to identify significant row/col shifts in hit frequency (chi-square test) or score distribution.
+alpha_qc <- 0.05
 well_fold_threshold <- 3   # flag well positions hit >= Nx the mean recurrence rate
-score_outlier_sd <- 2      # flag cols/rows whose median BZScore is >n SDs from mean of medians
+score_outlier_sd <- 3      # flag cols/rows whose median BZScore is >n SDs from mean of medians
 
 # ============================================================
 # 2. HELPERS
@@ -1587,21 +1590,6 @@ parse_well <- function(df)
   df %>% mutate(row=str_sub(Well,1,1), col=as.integer(str_remove(Well,"^[A-Za-z]")),
                 col2=sprintf("%02d",col), well_pos=paste0(row,col2))
 
-mw_test <- function(df, group_var, value_col) {
-  bind_rows(lapply(levels(df[[group_var]]), function(g) {
-    in_g <- df[[group_var]] == g
-    x1 <- df[[value_col]][in_g];  x2 <- df[[value_col]][!in_g]
-    if (length(na.omit(x1)) < 3 || length(na.omit(x2)) < 3) {
-      res <- setNames(list(g, NA_real_, NA_real_), c(group_var,"statistic","p_value"))
-    } else {
-      wt  <- wilcox.test(x1, x2, alternative="two.sided", exact=FALSE)
-      res <- setNames(list(g, as.numeric(wt$statistic), as.numeric(wt$p.value)),
-                      c(group_var,"statistic","p_value"))
-    }
-    as_tibble(res)
-  })) %>% mutate(p_fdr=p.adjust(p_value, method="BH")) %>% arrange(p_value)
-}
-
 chisq_hit_test <- function(df, group_var, hit_col="Hit") {
   counts <- df %>%
     group_by(.data[[group_var]]) %>%
@@ -1613,8 +1601,8 @@ chisq_hit_test <- function(df, group_var, hit_col="Hit") {
     arrange(desc(abs(std_resid)))
 }
 
-# ── NEW: score-based outlier detection for cols/rows ─────────────────────────
-chisq_score_shift <- function(df, group_var, score_col="BZScore", n_sd=score_outlier_sd) {
+chisq_score_shift <- function(df, group_var, score_col=NULL, n_sd=score_outlier_sd) {
+  if (is.null(score_col)) stop("score_col must be specified, e.g. 'BZScore' or 'ZScore'")
   grp_medians <- df %>%
     group_by(.data[[group_var]]) %>%
     summarize(n=n(), med=median(.data[[score_col]], na.rm=TRUE), .groups="drop")
@@ -1633,7 +1621,7 @@ chisq_score_shift <- function(df, group_var, score_col="BZScore", n_sd=score_out
     arrange(desc(abs(z_of_median)))
 }
 
-# ── UPDATED: fold-over-mean recurrence ───────────────────────────────────────
+# Fold-over-mean recurrence  
 well_recurrence_test <- function(df, hit_col="Hit", fold_threshold=well_fold_threshold) {
   n_pl <- n_distinct(df$Plate)
   recurrence <- df %>% filter(.data[[hit_col]]==1) %>%
@@ -1653,22 +1641,11 @@ well_recurrence_test <- function(df, hit_col="Hit", fold_threshold=well_fold_thr
   )
 }
 
-fisher_test_plate <- function(df, hit_col="Hit") {
-  bind_rows(lapply(sort(unique(df$Plate)), function(g) {
-    in_g <- df$Plate == g
-    tab  <- matrix(c(sum(df[[hit_col]][in_g]==1,  na.rm=TRUE), sum(df[[hit_col]][in_g]==0,  na.rm=TRUE),
-                     sum(df[[hit_col]][!in_g]==1, na.rm=TRUE), sum(df[[hit_col]][!in_g]==0, na.rm=TRUE)),
-                   nrow=2, byrow=TRUE)
-    ft <- fisher.test(tab, alternative="greater")
-    tibble(Plate=g, p_value=as.numeric(ft$p.value),
-           n_plate=sum(in_g), hits_plate=tab[1,1], hits_other=tab[2,1])
-  })) %>% mutate(p_fdr=p.adjust(p_value, method="BH")) %>% arrange(p_value)
-}
-
 plot_plate_hits <- function(df, hit_col="Hit", sig_plates=character(0), title="Hits: global plate totals") {
   plate_sum <- df %>% group_by(Plate) %>%
     summarize(hit_sum=sum(.data[[hit_col]]==1, na.rm=TRUE), .groups="drop") %>%
     mutate(sig=Plate %in% sig_plates)
+  
   ggplot(plate_sum, aes(x=factor(Plate), y=hit_sum)) +
     geom_col(fill="#2E1A47", color="black", linewidth=0.25, width=0.9) +
     geom_text(aes(label=hit_sum), vjust=-0.35, size=3) +
@@ -1746,45 +1723,27 @@ plate_col_stats <- df %>% group_by(Plate,col2) %>%
 # ============================================================
 # 5. TESTS
 # ============================================================
-test_row_z  <- mw_test(df,"row","ZScore")
-test_col_z  <- mw_test(df,"col2","ZScore")
-test_well_z <- mw_test(df,"well_pos","ZScore")
-if (has_bz) { test_row_bz  <- mw_test(df,"row","BZScore")
-              test_col_bz  <- mw_test(df,"col2","BZScore")
-              test_well_bz <- mw_test(df,"well_pos","BZScore") }
-
 test_row_hit         <- chisq_hit_test(df,"row")
 test_col_hit         <- chisq_hit_test(df,"col2")
-test_plate_Hit       <- fisher_test_plate(df)
-test_well_recurrence <- well_recurrence_test(df, fold_threshold=well_fold_threshold)
+test_plate_hit       <- chisq_hit_test(df, "Plate")
 
-# ── UPDATED: score outlier tests replace MW-based sig_cols/rows_score ────────
+test_well_recurrence <- well_recurrence_test(df, fold_threshold=well_fold_threshold)
 test_col_score_shift <- chisq_score_shift(df, "col2", score_col=score_col)
 test_row_score_shift <- chisq_score_shift(df, "row",  score_col=score_col)
 
-# Significant groups
-sig_rows_hit       <- test_row_hit         %>% filter(flagged) %>% pull(row)      %>% as.character()
-sig_cols_hit       <- test_col_hit         %>% filter(flagged) %>% pull(col2)     %>% as.character()
-sig_plates_hit     <- test_plate_Hit       %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(Plate) %>% as.character()
-recurrent_wells    <- test_well_recurrence %>% filter(flagged) %>% pull(well_pos) %>% as.character()
-sig_cols_score     <- test_col_score_shift %>% filter(flagged) %>% pull(col2)     %>% as.character()
-sig_rows_score     <- test_row_score_shift %>% filter(flagged) %>% pull(row)      %>% as.character()
+sig_rows_hit     <- test_row_hit         %>% filter(flagged) %>% pull(row)      %>% as.character()
+sig_cols_hit     <- test_col_hit         %>% filter(flagged) %>% pull(col2)     %>% as.character()
+sig_plates_hit   <- test_plate_hit %>% filter(flagged) %>% pull(Plate) %>% as.character()
+recurrent_wells  <- test_well_recurrence %>% filter(flagged) %>% pull(well_pos) %>% as.character()
+sig_cols_score   <- test_col_score_shift %>% filter(flagged) %>% pull(col2)     %>% as.character()
+sig_rows_score   <- test_row_score_shift %>% filter(flagged) %>% pull(row)      %>% as.character()
 
-# Direction lookups for type_string labels
 col_direction <- test_col_score_shift %>% filter(flagged) %>% select(col2, direction) %>% deframe()
 row_direction <- test_row_score_shift %>% filter(flagged) %>% select(row,  direction) %>% deframe()
-
-# Well position MW score (kept for export, not used in per-hit flagging)
-sig_wp_score <- if (has_bz) {
-  test_well_bz %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(well_pos) %>% as.character()
-} else {
-  test_well_z  %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(well_pos) %>% as.character()
-}
 
 cat("Flagged rows:", length(sig_rows_hit), "| cols:", length(sig_cols_hit),
     "| score-outlier rows:", length(sig_rows_score), "| score-outlier cols:", length(sig_cols_score),
     "| wells:", length(recurrent_wells), "| plates:", length(sig_plates_hit), "\n")
-
 # ============================================================
 # 6. PLOTS
 # ============================================================
@@ -1879,18 +1838,12 @@ wb <- createWorkbook()
 write_df <- function(s, x) { addWorksheet(wb,s); writeData(wb,s,x) }
 
 write_df("HITS_with_QC_flags",         hits_df_qc)
-write_df("TEST_plate_HitPref_vs_rest", test_plate_Hit)
-write_df("TEST_row_Z_vs_rest",         test_row_z)
-write_df("TEST_col_Z_vs_rest",         test_col_z)
-write_df("TEST_wellpos_Z_vs_rest",     test_well_z)
-if (has_bz) { write_df("TEST_row_BZ_vs_rest",    test_row_bz)
-              write_df("TEST_col_BZ_vs_rest",     test_col_bz)
-              write_df("TEST_wellpos_BZ_vs_rest", test_well_bz) }
-write_df("TEST_row_chisq_hit",        test_row_hit)
-write_df("TEST_col_chisq_hit",        test_col_hit)
-write_df("TEST_col_score_shift",      test_col_score_shift)
-write_df("TEST_row_score_shift",      test_row_score_shift)
-write_df("TEST_well_recurrence",      test_well_recurrence)
+write_df("TEST_plate_chisq_hit",       test_plate_hit)
+write_df("TEST_row_chisq_hit",         test_row_hit)
+write_df("TEST_col_chisq_hit",         test_col_hit)
+write_df("TEST_col_score_shift",       test_col_score_shift)
+write_df("TEST_row_score_shift",       test_row_score_shift)
+write_df("TEST_well_recurrence",       test_well_recurrence)
 write_df("global_row_medians",  left_join(row_z,row_bz,by="row")  %>% left_join(row_h, by="row"))
 write_df("global_col_medians",  left_join(col_z,col_bz,by="col2") %>% left_join(col_h, by="col2"))
 write_df("global_grid",         grid_sum)
@@ -1899,6 +1852,7 @@ write_df("plate_col_stats",     plate_col_stats)
 
 saveWorkbook(wb, file.path(out_dir,"HTS_QC_RESULTS.xlsx"), overwrite=TRUE)
 invisible(NULL)
+
 ```
 
 
