@@ -1537,629 +1537,368 @@ normalized_dist <- normalized_dist +
 # ============================================================
 #If not previously defined:
 #fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
-file_Location <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/"
-fileX <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx"
-export_File <- fileX
-sheetX  <- "Combined Analysis"
-out_dir <- paste0(file_Location, "HTS_QC_OUT/")
+
+file_Location    <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/"
+fileX            <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx"
+sheetX           <- "Combined Analysis"
+out_dir          <- paste0(file_Location, "HTS_QC_OUT/")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-hit_threshold <- 2
-alpha_qc <- 0.05
+hit_threshold    <- 2
+alpha_qc         <- 0.05
+well_fold_threshold <- 3   # flag well positions hit >= Nx the mean recurrence rate
+score_outlier_sd <- 2      # flag cols/rows whose median BZScore is >n SDs from mean of medians
 
 # ============================================================
-# 2. HELPER FUNCTIONS
+# 2. HELPERS
 # ============================================================
+save_plot <- function(p, fname, w=12, h=6)
+  ggsave(file.path(out_dir, fname), plot=p, width=w, height=h, dpi=300)
 
-# --- Plotting utilities ---
-save_plot <- function(p, fname, w=12, h=6) {
-  ggsave(file.path(out_dir, fname), plot = p, width=w, height=h, dpi=300)
-}
+theme_prismish <- function(base_size=12)
+  theme_classic(base_size=base_size) +
+  theme(plot.title   = element_text(face="bold", size=16),
+        axis.title.x = element_text(face="bold", size=16),
+        axis.title.y = element_text(face="bold", size=16),
+        axis.text.x  = element_text(face="bold", size=14),
+        axis.text.y  = element_text(face="bold", size=14),
+        panel.grid   = element_blank())
 
-theme_prismish <- function(base_size = 12) {
-  theme_classic(base_size = base_size) +
-    theme(
-      plot.title  = element_text(face = "bold", size = 16),
-
-      axis.title.x = element_text(face = "bold", size = 16),
-      axis.title.y = element_text(face = "bold", size = 16),
-
-      axis.text.x  = element_text(face = "bold", size = 14),
-      axis.text.y  = element_text(face = "bold", size = 14),
-
-      panel.grid = element_blank()
-    )
-}
-
-
-bar_shift <- function(df_sum, xcol, ycol, title, xlab, ylab,
-                      rotate_x = FALSE, ylim = NULL) {
-
-  p <- ggplot(df_sum, aes(x = .data[[xcol]], y = .data[[ycol]])) +
-    geom_col(fill = "#2E1A47", color = "black", linewidth = 0.25, width = 0.9) +
-    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
-    labs(title = title, x = xlab, y = ylab) +
-    theme_prismish()
-
-  if (!is.null(ylim)) p <- p + coord_cartesian(ylim = ylim)
-  if (rotate_x) p <- p + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+bar_shift <- function(df_sum, xcol, ycol, title, xlab, ylab, rotate_x=FALSE, ylim=NULL) {
+  p <- ggplot(df_sum, aes(x=.data[[xcol]], y=.data[[ycol]])) +
+    geom_col(fill="#2E1A47", color="black", linewidth=0.25, width=0.9) +
+    geom_hline(yintercept=0, linetype="dashed", linewidth=0.4) +
+    labs(title=title, x=xlab, y=ylab) + theme_prismish()
+  if (!is.null(ylim))  p <- p + coord_cartesian(ylim=ylim)
+  if (rotate_x)        p <- p + theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1))
   p
 }
 
+heatmap_metric <- function(df_grid, fill_col, title, fill_lab)
+  ggplot(df_grid, aes(x=factor(col2), y=row, fill=.data[[fill_col]])) +
+  geom_tile(color=NA) +
+  labs(title=title, x="Column", y="Row", fill=fill_lab) +
+  theme_prismish() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5), legend.position="right") +
+  scale_fill_viridis_c(option="viridis", na.value="grey90") +
+  guides(fill=guide_colorbar(title.position="top", barwidth=unit(0.5,"cm"), barheight=unit(6,"cm")))
 
-heatmap_metric <- function(df_grid, fill_col, title, fill_lab) {
-  ggplot(df_grid, aes(x = factor(col2), y = row, fill = .data[[fill_col]])) +
-    geom_tile(color = NA) +
-    labs(title = title, x = "Column", y = "Row", fill = fill_lab) +
-    theme_prismish() +
-    theme(axis.text.x = element_text(angle=90, vjust=0.5),
-          legend.position = "right") +
-    scale_fill_viridis_c(option = "viridis", na.value = "grey90") +
-    guides(fill = guide_colorbar(title.position = "top", barwidth = unit(0.5, "cm"), barheight = unit(6, "cm")))
+parse_well <- function(df)
+  df %>% mutate(row=str_sub(Well,1,1), col=as.integer(str_remove(Well,"^[A-Za-z]")),
+                col2=sprintf("%02d",col), well_pos=paste0(row,col2))
+
+mw_test <- function(df, group_var, value_col) {
+  bind_rows(lapply(levels(df[[group_var]]), function(g) {
+    in_g <- df[[group_var]] == g
+    x1 <- df[[value_col]][in_g];  x2 <- df[[value_col]][!in_g]
+    if (length(na.omit(x1)) < 3 || length(na.omit(x2)) < 3) {
+      res <- setNames(list(g, NA_real_, NA_real_), c(group_var,"statistic","p_value"))
+    } else {
+      wt  <- wilcox.test(x1, x2, alternative="two.sided", exact=FALSE)
+      res <- setNames(list(g, as.numeric(wt$statistic), as.numeric(wt$p.value)),
+                      c(group_var,"statistic","p_value"))
+    }
+    as_tibble(res)
+  })) %>% mutate(p_fdr=p.adjust(p_value, method="BH")) %>% arrange(p_value)
 }
 
-save_bar_fig_constant_barwidth <- function(p, fname, n_bars,
-                                           inches_per_bar = 0.55,
-                                           base_inches = 4,
-                                           h = 9,
-                                           min_w = 10,
-                                           max_w = 20) {
-  w <- base_inches + inches_per_bar * n_bars
-  w <- max(min_w, min(max_w, w))
-  ggsave(file.path(out_dir, fname), plot = p, width = w, height = h, dpi = 300)
+chisq_hit_test <- function(df, group_var, hit_col="Hit") {
+  counts <- df %>%
+    group_by(.data[[group_var]]) %>%
+    summarize(n=n(), hits=sum(.data[[hit_col]]==1, na.rm=TRUE), .groups="drop") %>%
+    mutate(hit_rate=hits/n)
+  ct <- chisq.test(counts$hits, p=counts$n/sum(counts$n))
+  counts %>% mutate(std_resid=as.numeric(ct$stdres), global_p=ct$p.value,
+                    flagged=global_p < alpha_qc & abs(std_resid) > 2) %>%
+    arrange(desc(abs(std_resid)))
 }
 
+# ── NEW: score-based outlier detection for cols/rows ─────────────────────────
+chisq_score_shift <- function(df, group_var, score_col="BZScore", n_sd=score_outlier_sd) {
+  grp_medians <- df %>%
+    group_by(.data[[group_var]]) %>%
+    summarize(n=n(), med=median(.data[[score_col]], na.rm=TRUE), .groups="drop")
+  global_mean <- mean(grp_medians$med, na.rm=TRUE)
+  global_sd   <- sd(grp_medians$med,   na.rm=TRUE)
+  grp_medians %>%
+    mutate(
+      z_of_median = (med - global_mean) / global_sd,
+      flagged     = abs(z_of_median) > n_sd,
+      direction   = case_when(
+        z_of_median >  n_sd ~ "enriched",
+        z_of_median < -n_sd ~ "suppressed",
+        TRUE                ~ "normal"
+      )
+    ) %>%
+    arrange(desc(abs(z_of_median)))
+}
 
-# --- Data parsing ---
-parse_well <- function(df) {
-  df %>% mutate(
-    row = str_sub(Well, 1, 1),
-    col = as.integer(str_remove(Well, "^[A-Za-z]")),
-    col2 = sprintf("%02d", col),
-    well_pos = paste0(row, col2)
+# ── UPDATED: fold-over-mean recurrence ───────────────────────────────────────
+well_recurrence_test <- function(df, hit_col="Hit", fold_threshold=well_fold_threshold) {
+  n_pl <- n_distinct(df$Plate)
+  recurrence <- df %>% filter(.data[[hit_col]]==1) %>%
+    group_by(well_pos) %>%
+    summarize(n_plates_as_hit=n_distinct(Plate), hit_rate=n_plates_as_hit/n_pl,
+              plates=paste(sort(unique(Plate)), collapse=", "), .groups="drop") %>%
+    arrange(desc(n_plates_as_hit))
+  mean_recurrence <- mean(recurrence$n_plates_as_hit)
+  threshold       <- mean_recurrence * fold_threshold
+  cat("Well recurrence: mean =", round(mean_recurrence,2),
+      "| fold threshold =", fold_threshold,
+      "| flagging wells with >=", round(threshold,2), "plates\n")
+  recurrence %>% mutate(
+    mean_recurrence = mean_recurrence,
+    fold_over_mean  = n_plates_as_hit / mean_recurrence,
+    flagged         = n_plates_as_hit >= threshold
   )
 }
 
-# --- Statistical testing functions ---
-mw_test <- function(df, group_var, value_col) {
-  group_levels <- levels(df[[group_var]])
-  
-  bind_rows(lapply(group_levels, function(g) {
-    in_group <- df[[group_var]] == g
-    x1 <- df[[value_col]][in_group]
-    x2 <- df[[value_col]][!in_group]
-
-    if (length(na.omit(x1)) < 3 || length(na.omit(x2)) < 3) {
-      result <- setNames(list(g, NA_real_, NA_real_), c(group_var, "statistic", "p_value"))
-    } else {
-      wt <- wilcox.test(x1, x2, alternative = "two.sided", exact = FALSE)
-      result <- setNames(list(g, as.numeric(wt$statistic), as.numeric(wt$p.value)), 
-                        c(group_var, "statistic", "p_value"))
-    }
-    
-    result <- as_tibble(result)
-    
-    if (group_var == "well_pos") {
-      result <- result %>% mutate(
-        n_in = sum(in_group),
-        n_out = sum(!in_group),
-        med_in = median(x1, na.rm = TRUE),
-        med_out = median(x2, na.rm = TRUE)
-      )
-    }
-    result
-  })) %>%
-    mutate(p_fdr = p.adjust(p_value, method = "BH")) %>%
-    arrange(p_value)
+fisher_test_plate <- function(df, hit_col="Hit") {
+  bind_rows(lapply(sort(unique(df$Plate)), function(g) {
+    in_g <- df$Plate == g
+    tab  <- matrix(c(sum(df[[hit_col]][in_g]==1,  na.rm=TRUE), sum(df[[hit_col]][in_g]==0,  na.rm=TRUE),
+                     sum(df[[hit_col]][!in_g]==1, na.rm=TRUE), sum(df[[hit_col]][!in_g]==0, na.rm=TRUE)),
+                   nrow=2, byrow=TRUE)
+    ft <- fisher.test(tab, alternative="greater")
+    tibble(Plate=g, p_value=as.numeric(ft$p.value),
+           n_plate=sum(in_g), hits_plate=tab[1,1], hits_other=tab[2,1])
+  })) %>% mutate(p_fdr=p.adjust(p_value, method="BH")) %>% arrange(p_value)
 }
 
-fisher_test <- function(df, group_var, hit_col = "Hit") {
-  group_levels <- if (is.factor(df[[group_var]])) {
-    levels(df[[group_var]])
-  } else {
-    sort(unique(df[[group_var]]))
-  }
-  
-  bind_rows(lapply(group_levels, function(g) {
-    in_group <- df[[group_var]] == g
-    
-    tab <- matrix(c(
-      sum(df[[hit_col]][in_group] == 1, na.rm=TRUE),
-      sum(df[[hit_col]][in_group] == 0, na.rm=TRUE),
-      sum(df[[hit_col]][!in_group] == 1, na.rm=TRUE),
-      sum(df[[hit_col]][!in_group] == 0, na.rm=TRUE)
-    ), nrow = 2, byrow = TRUE)
-
-    ft <- fisher.test(tab, alternative = "greater")
-    
-    result <- setNames(list(g, as.numeric(ft$p.value)), c(group_var, "p_value"))
-    result <- as_tibble(result)
-    
-    if (group_var == "well_pos") {
-      result <- result %>% mutate(
-        n_in = sum(in_group),
-        hit_in = tab[1,1],
-        hit_out = tab[2,1]
-      )
-    } else if (group_var == "Plate") {
-      result <- result %>% mutate(
-        n_plate = sum(in_group),
-        hits_plate = tab[1,1],
-        hits_other = tab[2,1]
-      )
-    }
-    result
-  })) %>%
-    mutate(p_fdr = p.adjust(p_value, method = "BH")) %>%
-    arrange(p_value)
+plot_plate_hits <- function(df, hit_col="Hit", sig_plates=character(0), title="Hits: global plate totals") {
+  plate_sum <- df %>% group_by(Plate) %>%
+    summarize(hit_sum=sum(.data[[hit_col]]==1, na.rm=TRUE), .groups="drop") %>%
+    mutate(sig=Plate %in% sig_plates)
+  ggplot(plate_sum, aes(x=factor(Plate), y=hit_sum)) +
+    geom_col(fill="#2E1A47", color="black", linewidth=0.25, width=0.9) +
+    geom_text(aes(label=hit_sum), vjust=-0.35, size=3) +
+    geom_text(data=subset(plate_sum,sig), aes(label="*"), vjust=-1.2, size=6) +
+    labs(title=title, x="Plate", y="Total hits") + theme_prismish() +
+    theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1))
 }
 
-plot_plate_hits <- function(df, hit_col = "Hit", sig_plates = character(0), 
-                            title = "Hits: global plate totals") {
-  plate_sum <- df %>%
-    group_by(Plate) %>%
-    summarize(hit_sum = sum(.data[[hit_col]] == 1, na.rm = TRUE), .groups = "drop") %>%
-    mutate(sig = Plate %in% sig_plates)
+paper_div_impact_clean <- function(lims=c(-2,2), midpoint=0)
+  scale_fill_gradientn(
+    colours=c("#E00000","#FF7A00","#FFFFFF","#5A0AA4","#1A0033"),
+    values=scales::rescale(c(lims[1], lims[1]+(midpoint-lims[1])*0.5, midpoint,
+                             midpoint+(lims[2]-midpoint)*0.5, lims[2]), from=lims),
+    limits=lims, oob=scales::squish)
 
-  ggplot(plate_sum, aes(x = factor(Plate), y = hit_sum)) +
-    geom_col(fill = "#2E1A47", color = "black", linewidth = 0.25, width = 0.9) +
-    geom_text(aes(label = hit_sum), vjust = -0.35, size = 3) +
-    geom_text(data = subset(plate_sum, sig), aes(label="*"), vjust = -1.2, size = 6) +
-    labs(title = title, x = "Plate", y = "Total hits") +
-    theme_prismish() +
-    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
-}
+hit_impact_purple_deeper <- function(max_hits, zero_color="#F5F5F5")
+  scale_fill_gradientn(
+    colours=c(zero_color,"#B8AEC9","#5A3E86","#4A3A73","#1A0033"),
+    values=scales::rescale(c(0, max_hits*0.3, max_hits*0.55, max_hits*0.8, max_hits),
+                           from=c(0,max_hits)),
+    limits=c(0,max_hits), oob=scales::squish,
+    guide=guide_colorbar(title="Hits per well", barheight=unit(5,"cm")))
+
+heatmap_theme_clean <- theme(
+  plot.title=element_text(size=16, face="bold", hjust=0),
+  axis.title=element_text(size=14, face="bold"),
+  axis.text.x=element_text(size=12, face="bold"),
+  axis.text.y=element_text(size=12, face="bold"),
+  legend.title=element_text(size=14, face="bold"),
+  legend.text=element_text(size=12, face="bold"))
 
 # ============================================================
-# 3. DATA LOADING & PREPARATION
+# 3. LOAD & PREP
 # ============================================================
-df <- read.xlsx(fileX, sheet = sheetX) %>%
-  parse_well()
-
-# make BZScore optional: if missing, create as NA_real_
-# Ensure BZScore exists (optional column)
-if (!("BZScore" %in% colnames(df))) {
-  df$BZScore <- NA_real_
-}
-
+df <- read.xlsx(fileX, sheet=sheetX) %>% parse_well()
+if (!("BZScore" %in% colnames(df))) df$BZScore <- NA_real_
 has_bz <- any(!is.na(df$BZScore))
 
-df <- df %>%
-  mutate(
-    Hit = if ("Hit" %in% colnames(.)) {
-      as.integer(Hit)
-    } else if (has_bz) {
-      as.integer(BZScore >= hit_threshold)
-    } else {
-      as.integer(ZScore >= hit_threshold)
-    },
-    Hit = Hit
-  )
+df <- df %>% mutate(
+  Hit  = if ("Hit" %in% colnames(.)) as.integer(Hit)
+         else if (has_bz) as.integer(BZScore >= hit_threshold)
+         else as.integer(ZScore >= hit_threshold),
+  row      = factor(str_sub(Well,1,1) %>% {factor(., levels=sort(unique(.)))}),
+  col2     = factor(sprintf("%02d", as.integer(str_remove(Well,"^[A-Za-z]"))),
+                    levels=sprintf("%02d", sort(unique(as.integer(str_remove(Well,"^[A-Za-z]")))))),
+  well_pos = factor(well_pos)
+)
 
-score_metric <- if ("Hit" %in% colnames(df)) {
-  "Hit (precomputed)"
-} else if (has_bz) {
-  "BZScore"
-} else {
-  "ZScore"
-}
-
-# Factor ordering
-row_levels <- sort(unique(df$row))
-col_levels <- sprintf("%02d", sort(unique(as.integer(df$col2))))
-df <- df %>%
-  mutate(
-    row = factor(row, levels = row_levels),
-    col2 = factor(col2, levels = col_levels),
-    well_pos = factor(well_pos)
-  )
-# ============================================================
-# 4. GLOBAL SUMMARY STATISTICS
-# ============================================================
-
-# Row summaries
-row_z  <- df %>% group_by(row) %>% summarize(med_z = median(ZScore, na.rm=TRUE), .groups="drop")
-row_bz <- df %>% group_by(row) %>% summarize(med_bz = median(BZScore, na.rm=TRUE), .groups="drop")
-row_h  <- df %>% group_by(row) %>% summarize(hit_sum = sum(Hit, na.rm=TRUE), .groups="drop")
-
-# Column summaries
-col_z  <- df %>% group_by(col2) %>% summarize(med_z = median(ZScore, na.rm=TRUE), .groups="drop")
-col_bz <- df %>% group_by(col2) %>% summarize(med_bz = median(BZScore, na.rm=TRUE), .groups="drop")
-col_h  <- df %>% group_by(col2) %>% summarize(hit_sum = sum(Hit, na.rm=TRUE), .groups="drop")
-
-# Well position grid
-grid_sum <- df %>%
-  group_by(row, col2) %>%
-  summarize(
-    med_z = median(ZScore, na.rm=TRUE),
-    med_bz = median(BZScore, na.rm=TRUE),
-    hit_sum = sum(Hit, na.rm=TRUE),
-    .groups = "drop"
-  )
-
-# Per-plate summaries
-plate_row_stats <- df %>%
-  group_by(Plate, row) %>%
-  summarize(n = n(), med_z = median(ZScore, na.rm=TRUE), 
-            med_bz = median(BZScore, na.rm=TRUE), hit_sum = sum(Hit, na.rm=TRUE), .groups="drop")
-
-plate_col_stats <- df %>%
-  group_by(Plate, col2) %>%
-  summarize(n = n(), med_z = median(ZScore, na.rm=TRUE), 
-            med_bz = median(BZScore, na.rm=TRUE), hit_sum = sum(Hit, na.rm=TRUE), .groups="drop")
+score_metric <- if ("Hit" %in% colnames(df)) "Hit (precomputed)" else if (has_bz) "BZScore" else "ZScore"
+score_col    <- if (has_bz) "BZScore" else "ZScore"
 
 # ============================================================
-# 5. STATISTICAL TESTS
+# 4. SUMMARIES
 # ============================================================
+summarize_by <- function(df, grp, ...) df %>% group_by(.data[[grp]]) %>% summarize(..., .groups="drop")
 
-# Tests on score metrics
-test_row_z  <- mw_test(df, "row", "ZScore")
-test_col_z  <- mw_test(df, "col2", "ZScore")
-test_well_z <- mw_test(df, "well_pos", "ZScore")
+row_z  <- summarize_by(df,"row",  med_z=median(ZScore,na.rm=TRUE))
+row_bz <- summarize_by(df,"row",  med_bz=median(BZScore,na.rm=TRUE))
+row_h  <- summarize_by(df,"row",  hit_sum=sum(Hit,na.rm=TRUE))
+col_z  <- summarize_by(df,"col2", med_z=median(ZScore,na.rm=TRUE))
+col_bz <- summarize_by(df,"col2", med_bz=median(BZScore,na.rm=TRUE))
+col_h  <- summarize_by(df,"col2", hit_sum=sum(Hit,na.rm=TRUE))
 
-if (has_bz) {
-  test_row_bz  <- mw_test(df, "row", "BZScore")
-  test_col_bz  <- mw_test(df, "col2", "BZScore")
-  test_well_bz <- mw_test(df, "well_pos", "BZScore")
-}
+grid_sum <- df %>% group_by(row,col2) %>%
+  summarize(med_z=median(ZScore,na.rm=TRUE), med_bz=median(BZScore,na.rm=TRUE),
+            hit_sum=sum(Hit,na.rm=TRUE), .groups="drop")
 
-# Tests on hit enrichment
-test_row_hit  <- fisher_test(df, "row")
-test_col_hit  <- fisher_test(df, "col2")
-test_well_hit <- fisher_test(df, "well_pos")
-test_plate_Hit <- fisher_test(df, "Plate")
+plate_row_stats <- df %>% group_by(Plate,row) %>%
+  summarize(n=n(), med_z=median(ZScore,na.rm=TRUE), med_bz=median(BZScore,na.rm=TRUE),
+            hit_sum=sum(Hit,na.rm=TRUE), .groups="drop")
+plate_col_stats <- df %>% group_by(Plate,col2) %>%
+  summarize(n=n(), med_z=median(ZScore,na.rm=TRUE), med_bz=median(BZScore,na.rm=TRUE),
+            hit_sum=sum(Hit,na.rm=TRUE), .groups="drop")
 
-# Extract significant groups
-sig_rows_score <- if (has_bz) {
-  test_row_bz %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(row) %>% as.character()
-} else {
-  test_row_z %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(row) %>% as.character()
-}
+# ============================================================
+# 5. TESTS
+# ============================================================
+test_row_z  <- mw_test(df,"row","ZScore")
+test_col_z  <- mw_test(df,"col2","ZScore")
+test_well_z <- mw_test(df,"well_pos","ZScore")
+if (has_bz) { test_row_bz  <- mw_test(df,"row","BZScore")
+              test_col_bz  <- mw_test(df,"col2","BZScore")
+              test_well_bz <- mw_test(df,"well_pos","BZScore") }
 
-sig_cols_score <- if (has_bz) {
-  test_col_bz %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(col2) %>% as.character()
-} else {
-  test_col_z %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(col2) %>% as.character()
-}
+test_row_hit         <- chisq_hit_test(df,"row")
+test_col_hit         <- chisq_hit_test(df,"col2")
+test_plate_Hit       <- fisher_test_plate(df)
+test_well_recurrence <- well_recurrence_test(df, fold_threshold=well_fold_threshold)
 
+# ── UPDATED: score outlier tests replace MW-based sig_cols/rows_score ────────
+test_col_score_shift <- chisq_score_shift(df, "col2", score_col=score_col)
+test_row_score_shift <- chisq_score_shift(df, "row",  score_col=score_col)
+
+# Significant groups
+sig_rows_hit       <- test_row_hit         %>% filter(flagged) %>% pull(row)      %>% as.character()
+sig_cols_hit       <- test_col_hit         %>% filter(flagged) %>% pull(col2)     %>% as.character()
+sig_plates_hit     <- test_plate_Hit       %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(Plate) %>% as.character()
+recurrent_wells    <- test_well_recurrence %>% filter(flagged) %>% pull(well_pos) %>% as.character()
+sig_cols_score     <- test_col_score_shift %>% filter(flagged) %>% pull(col2)     %>% as.character()
+sig_rows_score     <- test_row_score_shift %>% filter(flagged) %>% pull(row)      %>% as.character()
+
+# Direction lookups for type_string labels
+col_direction <- test_col_score_shift %>% filter(flagged) %>% select(col2, direction) %>% deframe()
+row_direction <- test_row_score_shift %>% filter(flagged) %>% select(row,  direction) %>% deframe()
+
+# Well position MW score (kept for export, not used in per-hit flagging)
 sig_wp_score <- if (has_bz) {
   test_well_bz %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(well_pos) %>% as.character()
 } else {
-  test_well_z %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(well_pos) %>% as.character()
+  test_well_z  %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(well_pos) %>% as.character()
 }
 
-sig_rows_hit   <- test_row_hit %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(row) %>% as.character()
-sig_cols_hit   <- test_col_hit %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(col2) %>% as.character()
-sig_wp_hit     <- test_well_hit %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(well_pos) %>% as.character()
-sig_plates_hit <- test_plate_Hit %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(Plate) %>% as.character()
+cat("Flagged rows:", length(sig_rows_hit), "| cols:", length(sig_cols_hit),
+    "| score-outlier rows:", length(sig_rows_score), "| score-outlier cols:", length(sig_cols_score),
+    "| wells:", length(recurrent_wells), "| plates:", length(sig_plates_hit), "\n")
 
 # ============================================================
-# 6. VISUALIZATION
+# 6. PLOTS
 # ============================================================
+lim_val  <- function(x) { v <- max(abs(x), na.rm=TRUE); ifelse(is.finite(v) && v>0, v, 1) }
+ylim_row <- c(-1,1) * lim_val(c(row_z$med_z, row_bz$med_bz))
+ylim_col <- c(-1,1) * lim_val(c(col_z$med_z, col_bz$med_bz))
 
-# Shared y-axis limits
-row_lim <- max(abs(c(row_z$med_z, row_bz$med_bz)), na.rm=TRUE)
-col_lim <- max(abs(c(col_z$med_z, col_bz$med_bz)), na.rm=TRUE)
-row_lim <- ifelse(is.finite(row_lim) && row_lim > 0, row_lim, 1)
-col_lim <- ifelse(is.finite(col_lim) && col_lim > 0, col_lim, 1)
-ylim_row <- c(-row_lim, row_lim)
-ylim_col <- c(-col_lim, col_lim)
-
-
-
-# Row plots
-p_row_z <- bar_shift(row_z, "row", "med_z", "ZScore: global row shift (median)", 
-                     "Row", "Median ZScore", ylim = ylim_row)
-p_row_h <- bar_shift(row_h, "row", "hit_sum", "Hits: global row totals", "Row", "Total hits")
-
+p_row_z <- bar_shift(row_z,  "row",  "med_z",   "ZScore: global row shift (median)",  "Row",    "Median ZScore",  ylim=ylim_row)
+p_row_h <- bar_shift(row_h,  "row",  "hit_sum", "Hits: global row totals",             "Row",    "Total hits")
+p_col_z <- bar_shift(col_z,  "col2", "med_z",   "ZScore: global col shift (median)",  "Column", "Median ZScore",  rotate_x=TRUE, ylim=ylim_col)
+p_col_h <- bar_shift(col_h,  "col2", "hit_sum", "Hits: global col totals",             "Column", "Total hits",     rotate_x=TRUE)
 if (has_bz) {
-  p_row_bz <- bar_shift(row_bz, "row", "med_bz", "BZScore: global row shift (median)", 
-                        "Row", "Median BZScore", ylim = ylim_row)
+  p_row_bz <- bar_shift(row_bz, "row",  "med_bz", "BZScore: global row shift (median)", "Row",    "Median BZScore", ylim=ylim_row)
+  p_col_bz <- bar_shift(col_bz, "col2", "med_bz", "BZScore: global col shift (median)", "Column", "Median BZScore", rotate_x=TRUE, ylim=ylim_col)
 }
 
+p_heat_z   <- heatmap_metric(grid_sum,"med_z",  "Heatmap: Median Z-Score by Well Position",   "Median Z-Score")  + paper_div_impact_clean() + heatmap_theme_clean + scale_y_discrete(limits=rev)
+p_heat_hit <- heatmap_metric(grid_sum,"hit_sum","Heatmap: Total Hits by Well Position",        "Total hits")      + hit_impact_purple_deeper(max(grid_sum$hit_sum,na.rm=TRUE)) + heatmap_theme_clean + scale_y_discrete(limits=rev)
+if (has_bz)
+  p_heat_bz <- heatmap_metric(grid_sum,"med_bz","Heatmap: Median BZ-Score by Well Position",  "Median BZ-Score") + paper_div_impact_clean() + heatmap_theme_clean + scale_y_discrete(limits=rev)
 
-# Column plots 
-p_col_z <- bar_shift(col_z, "col2", "med_z", "ZScore: global col shift (median)", 
-                     "Column", "Median ZScore", rotate_x = TRUE, ylim = ylim_col)
-p_col_h <- bar_shift(col_h, "col2", "hit_sum", "Hits: global col totals", 
-                     "Column", "Total hits", rotate_x = TRUE)
-
-if (has_bz) {
-  p_col_bz <- bar_shift(col_bz, "col2", "med_bz", "BZScore: global col shift (median)", 
-                        "Column", "Median BZScore", rotate_x = TRUE, ylim = ylim_col)
-}
-
-# Heatmaps
-p_heat_z <- heatmap_metric(grid_sum, "med_z", "Heatmap: median ZScore by well position", "Median ZScore")
-p_heat_hit <- heatmap_metric(grid_sum, "hit_sum", "Heatmap: total hits by well position", "Total hits")
-
-if (has_bz) {
-  p_heat_bz <- heatmap_metric(grid_sum, "med_bz", "Heatmap: median BZScore by well position", "Median BZScore")
-}
-
-# Plate hits
-p_plate_h <- plot_plate_hits(df, hit_col = "Hit", sig_plates = sig_plates_hit,
-                             title = "Hits: global plate totals (significant plates marked *)")
-
-
-heatmap_theme_clean <- theme(
-  plot.title = element_text(
-    size = 16,
-    face = "bold",
-    hjust = 0
-  ),
-  axis.title = element_text(
-    size = 14,
-    face = "bold"
-  ),
-  axis.text.x = element_text(
-    size = 12,
-    face = "bold"
-  ),
-  axis.text.y = element_text(
-    size = 12,
-    face = "bold"
-  ),
-  legend.title = element_text(
-    size = 14,
-    face = "bold"
-  ),
-  legend.text = element_text(
-    size = 12,
-    face = "bold"
-  )
-)
-paper_div_impact_clean <- function(lims = c(-2, 2), midpoint = 0) {
-
-  scale_fill_gradientn(
-    colours = c(
-      "#E00000",   # strong negative (clean red)
-      "#FF7A00",   # mild negative (orange)
-      "#FFFFFF",   # zero (pure white)
-      "#5A0AA4",   # mild positive (magenta)
-      "#1A0033"    # strong positive (deep purple)
-    ),  
-    values = scales::rescale(
-      c(
-        lims[1],
-        lims[1] + (midpoint - lims[1]) * 0.5,
-        midpoint,
-        midpoint + (lims[2] - midpoint) * 0.5,
-        lims[2]
-      ),
-      from = lims
-    ),
-    limits = lims,
-    oob    = scales::squish
-  )
-}
-
-# Apply to heatmaps
-p_heat_z  <- p_heat_z  + paper_div_impact_clean(lims = c(-2, 2))
-
-if (has_bz) {
-  p_heat_bz <- p_heat_bz + paper_div_impact_clean(lims = c(-2, 2))
-}
- 
-# 2) Hits map: force ALL non-hits to gray; only hits get color (discrete)
-#    (This requires the hits heatmap to use fill = Hits_bin, shown below.)
-# ---- Hits scale: gray background, colored hits, AND a visible legend ----
-# Make the legend show 0..max_hits, where max_hits = max hits per well (capped if you want)
- 
-# ---- Apply: set max to max(hits) per well (or cap, if you prefer) ----
-# ---- max hits per well for the legend ----
-# Continuous hits scale: 0 = modern gray; >0 ramps orange -> magenta -> near-black purple
-hit_impact_purple_deeper <- function(max_hits, zero_color = "#F5F5F5") {
-
-  scale_fill_gradientn(
-    colours = c(
-      zero_color,   # 0
-      "#B8AEC9",    # very light neutral violet (less pink)
-      "#5A3E86",    # balanced muted purple
-      "#4A3A73",    # deep plum
-      "#1A0033"     # endpoint (matches Z/BZ max)
-    ),
-    values = scales::rescale(
-      c(0,
-        max_hits * 0.3,
-        max_hits * 0.55,
-        max_hits * 0.8,
-        max_hits),
-      from = c(0, max_hits)
-    ),
-    limits = c(0, max_hits),
-    oob    = scales::squish,
-    guide  = guide_colorbar(
-      title     = "Hits per well",
-      barheight = unit(5, "cm")
-    )
-  )
-}
-max_hits_well <- max(grid_sum$hit_sum, na.rm = TRUE)
-
-p_heat_hit <- heatmap_metric(
-  grid_sum, "hit_sum",
-  "Heatmap: total hits by well position",
-  "Total hits"
-) +
-  hit_impact_purple_deeper(max_hits = max_hits_well) +
-  scale_y_discrete(limits = rev) +
-  theme(legend.position = "right")
-
-p_heat_z <- p_heat_z +
-  labs(
-    title = "Heatmap: Median Z-Score by Well Position",
-    fill  = "Median Z-Score"
-  ) +
-  heatmap_theme_clean +
-  scale_y_discrete(limits = rev) 
-
-if (has_bz) {
-  p_heat_bz <- p_heat_bz +
-    labs(
-      title = "Heatmap: Median BZ-Score by Well Position",
-      fill  = "Median BZ-Score"
-    ) +
-    heatmap_theme_clean +
-  scale_y_discrete(limits = rev) 
-  }
-
-p_heat_hit <- p_heat_hit +
-  labs(title = "Heatmap: Total Hits by Well Position") +
-  heatmap_theme_clean
-
-# =========================
-row_fig <- if (has_bz) {
-  (p_row_z / p_row_bz / p_row_h) + plot_layout(heights = c(1, 1, 1)) + plot_annotation(title = "Global Row QC")
-} else {
-  (p_row_z / p_row_h) + plot_layout(heights = c(1, 1)) + plot_annotation(title = "Global Row QC")
-}
-
-col_fig <- if (has_bz) {
-  (p_col_z / p_col_bz / p_col_h) + plot_layout(heights = c(1, 1, 1)) + plot_annotation(title = "Global Column QC")
-} else {
-  (p_col_z / p_col_h) + plot_layout(heights = c(1, 1)) + plot_annotation(title = "Global Column QC")
-}
-
-heat_fig <- if (has_bz) {
-  (p_heat_z / p_heat_bz / p_heat_hit) + plot_layout(heights = c(1, 1, 1)) 
-} else {
-  (p_heat_z / p_heat_hit) + plot_layout(heights = c(1, 1)) 
-}
-  
-n_row <- dplyr::n_distinct(df$row)   # or row_z$row
-n_col <- dplyr::n_distinct(df$col2)  # or col_z$col2
-
+p_plate_h <- plot_plate_hits(df, sig_plates=sig_plates_hit,
+                             title="Hits: global plate totals (significant plates marked *)")
 h_rc <- if (has_bz) 12 else 9
 
-save_bar_fig_constant_barwidth(row_fig, "QC_ROWS_combined.png", n_bars = n_row, h = h_rc)
-save_bar_fig_constant_barwidth(col_fig, "QC_COLS_combined.png", n_bars = n_col, h = h_rc)
+row_fig <- {
+  if (has_bz) (p_row_z/p_row_bz/p_row_h) + plot_layout(heights=c(1,1,1))
+  else        (p_row_z/p_row_h)           + plot_layout(heights=c(1,1))
+} + plot_annotation(title="Global Row QC")
 
-# heatmaps can stay fixed
+col_fig <- {
+  if (has_bz) (p_col_z/p_col_bz/p_col_h) + plot_layout(heights=c(1,1,1))
+  else        (p_col_z/p_col_h)           + plot_layout(heights=c(1,1))
+} + plot_annotation(title="Global Column QC")
 
-# Save plots
-save_plot(row_fig,  "QC_ROWS_combined.png",  w = 14, h = if (has_bz) 12 else 9)
-save_plot(col_fig,  "QC_COLS_combined.png",  w = 14, h = if (has_bz) 12 else 9)
-save_plot(heat_fig, "QC_HEAT_combined.png",  w = 12, h = if (has_bz) 12 else 9)
-save_plot(p_plate_h, "QC_PLATES_hits.png", w = 14, h = 7)
+heat_fig <- {
+  if (has_bz) (p_heat_z/p_heat_bz/p_heat_hit) + plot_layout(heights=c(1,1,1))
+  else        (p_heat_z/p_heat_hit)             + plot_layout(heights=c(1,1))
+}
+
+save_plot(row_fig,   "QC_ROWS_combined.png",  w=14, h=h_rc)
+save_plot(col_fig,   "QC_COLS_combined.png",  w=14, h=h_rc)
+save_plot(heat_fig,  "QC_HEAT_combined.png",  w=12, h=if(has_bz) 12 else 9)
+save_plot(p_plate_h, "QC_PLATES_hits.png",    w=14, h=7)
 
 # ============================================================
-# 7. QC ANNOTATION FOR HITS
+# 7. QC ANNOTATION
 # ============================================================
-
 type_string <- function(pl, r, c, wp) {
   out <- character(0)
-
-  if (!is.na(r) && as.character(r) %in% sig_rows_hit)   out <- c(out, "Row enrichment [Hit]")
-  if (!is.na(r) && as.character(r) %in% sig_rows_score) out <- c(out, paste0("Row shift [", score_metric, "]"))
-  if (!is.na(c) && as.character(c) %in% sig_cols_hit)   out <- c(out, "Col enrichment [Hit]")
-  if (!is.na(c) && as.character(c) %in% sig_cols_score) out <- c(out, paste0("Col shift [", score_metric, "]"))
-  if (!is.na(wp) && as.character(wp) %in% sig_wp_hit)   out <- c(out, "Well position enrichment [Hit]")
-  if (!is.na(wp) && as.character(wp) %in% sig_wp_score) out <- c(out, paste0("Well position shift [", score_metric, "]"))
-  if (!is.na(pl) && as.character(pl) %in% sig_plates_hit) out <- c(out, "Plate enrichment [Hit]")
-
-  if (length(out) == 0) return("None")
-  paste(unique(out), collapse = "; ")
+  if (!is.na(r)  && as.character(r)  %in% sig_rows_hit)
+    out <- c(out, "Row enrichment [Chi-sq]")
+  if (!is.na(r)  && as.character(r)  %in% sig_rows_score)
+    out <- c(out, paste0("Row score ", row_direction[as.character(r)], " [BZScore outlier]"))
+  if (!is.na(c)  && as.character(c)  %in% sig_cols_hit)
+    out <- c(out, "Col enrichment [Chi-sq]")
+  if (!is.na(c)  && as.character(c)  %in% sig_cols_score)
+    out <- c(out, paste0("Col score ", col_direction[as.character(c)], " [BZScore outlier]"))
+  if (!is.na(wp) && as.character(wp) %in% recurrent_wells)
+    out <- c(out, paste0("Well recurrence [>=", well_fold_threshold, "x mean]"))
+  if (!is.na(pl) && as.character(pl) %in% sig_plates_hit)
+    out <- c(out, "Plate enrichment [Hit]")
+  if (length(out)==0) return("None")
+  paste(unique(out), collapse="; ")
 }
 
-hits_df_qc <- df %>%
-  filter(Hit == 1) %>%
-  mutate(
-    Type_of_Error = purrr::pmap_chr(list(Plate, row, col2, well_pos), type_string),
-    Systematic_error = ifelse(Type_of_Error == "None", "No", "Yes"),
-    QC_alpha = alpha_qc
-  ) %>%
-  select(everything(), Systematic_error, Type_of_Error, QC_alpha) %>%
-  select(-any_of(c("Hit", "QC_row_score", "QC_col_score", "QC_well_score",
-                   "QC_row_hit", "QC_col_hit", "QC_well_hit", "QC_score_flag", "QC_hit_flag",
-                   "Systematic_plate_error", "Systematic_error_type", "QC_score_metric_used")))
+hits_df_qc <- df %>% filter(Hit==1) %>%
+  mutate(Type_of_Error    = purrr::pmap_chr(list(Plate,row,col2,well_pos), type_string),
+         Systematic_error = ifelse(Type_of_Error=="None","No","Yes"),
+         QC_alpha         = alpha_qc,
+         QC_well_fold_threshold = well_fold_threshold,
+         QC_score_outlier_sd   = score_outlier_sd) %>%
+  select(everything(), Systematic_error, Type_of_Error,
+         QC_alpha, QC_well_fold_threshold, QC_score_outlier_sd) %>%
+  select(-any_of(c("Hit","QC_row_score","QC_col_score","QC_well_score","QC_row_hit","QC_col_hit",
+                   "QC_well_hit","QC_score_flag","QC_hit_flag","Systematic_plate_error",
+                   "Systematic_error_type","QC_score_metric_used")))
 
 # ============================================================
-# 8. EXPORT RESULTS
+# 8. EXPORT
 # ============================================================
-
-# Add Hits_QC sheet to original workbook
 orig_wb <- loadWorkbook(fileX)
-hits_sheet_name <- "Hits_QC"
-if (hits_sheet_name %in% names(orig_wb)) removeWorksheet(orig_wb, hits_sheet_name)
-
-addWorksheet(orig_wb, hits_sheet_name)
+if ("Hits_QC" %in% names(orig_wb)) removeWorksheet(orig_wb, "Hits_QC")
+addWorksheet(orig_wb, "Hits_QC")
 hits_out <- hits_df_qc %>% mutate(across(where(is.factor), as.character))
-writeData(orig_wb, hits_sheet_name, hits_out)
-freezePane(orig_wb, hits_sheet_name, firstRow = TRUE)
-addFilter(orig_wb, hits_sheet_name, rows = 1, cols = 1:ncol(hits_out))
-saveWorkbook(orig_wb, fileX, overwrite = TRUE)
+writeData(orig_wb, "Hits_QC", hits_out)
+freezePane(orig_wb, "Hits_QC", firstRow=TRUE)
+addFilter(orig_wb,  "Hits_QC", rows=1, cols=1:ncol(hits_out))
+saveWorkbook(orig_wb, fileX, overwrite=TRUE)
 
-# Create comprehensive QC report workbook
 wb <- createWorkbook()
-write_df <- function(sheet_name, x) {
-  addWorksheet(wb, sheet_name)
-  writeData(wb, sheet_name, x)
-}
+write_df <- function(s, x) { addWorksheet(wb,s); writeData(wb,s,x) }
 
-write_df("HITS_with_QC_flags", hits_df_qc)
+write_df("HITS_with_QC_flags",         hits_df_qc)
 write_df("TEST_plate_HitPref_vs_rest", test_plate_Hit)
-write_df("TEST_row_Z_vs_rest", test_row_z)
-write_df("TEST_col_Z_vs_rest", test_col_z)
-write_df("TEST_wellpos_Z_vs_rest", test_well_z)
+write_df("TEST_row_Z_vs_rest",         test_row_z)
+write_df("TEST_col_Z_vs_rest",         test_col_z)
+write_df("TEST_wellpos_Z_vs_rest",     test_well_z)
+if (has_bz) { write_df("TEST_row_BZ_vs_rest",    test_row_bz)
+              write_df("TEST_col_BZ_vs_rest",     test_col_bz)
+              write_df("TEST_wellpos_BZ_vs_rest", test_well_bz) }
+write_df("TEST_row_chisq_hit",        test_row_hit)
+write_df("TEST_col_chisq_hit",        test_col_hit)
+write_df("TEST_col_score_shift",      test_col_score_shift)
+write_df("TEST_row_score_shift",      test_row_score_shift)
+write_df("TEST_well_recurrence",      test_well_recurrence)
+write_df("global_row_medians",  left_join(row_z,row_bz,by="row")  %>% left_join(row_h, by="row"))
+write_df("global_col_medians",  left_join(col_z,col_bz,by="col2") %>% left_join(col_h, by="col2"))
+write_df("global_grid",         grid_sum)
+write_df("plate_row_stats",     plate_row_stats)
+write_df("plate_col_stats",     plate_col_stats)
 
-if (has_bz) {
-  write_df("TEST_row_BZ_vs_rest", test_row_bz)
-  write_df("TEST_col_BZ_vs_rest", test_col_bz)
-  write_df("TEST_wellpos_BZ_vs_rest", test_well_bz)
-}
-
-write_df("TEST_row_Hit_vs_rest", test_row_hit)
-write_df("TEST_col_Hit_vs_rest", test_col_hit)
-write_df("TEST_wellpos_Hit_vs_rest", test_well_hit)
-write_df("global_row_medians", left_join(row_z, row_bz, by="row") %>% left_join(row_h, by="row"))
-write_df("global_col_medians", left_join(col_z, col_bz, by="col2") %>% left_join(col_h, by="col2"))
-write_df("global_grid", grid_sum)
-write_df("plate_row_stats", plate_row_stats)
-write_df("plate_col_stats", plate_col_stats)
-
-
-
-saveWorkbook(wb, file.path(out_dir, "HTS_QC_RESULTS.xlsx"), overwrite = TRUE)
-
+saveWorkbook(wb, file.path(out_dir,"HTS_QC_RESULTS.xlsx"), overwrite=TRUE)
 invisible(NULL)
-
-
-#Overwrite previous hits sheet in original workbook to add QC measures:
-
-sheet_hits <- "Hits"
-
-# 1) Build hits_df2 (hits + QC columns)
-hits_df <- if (assayType == "OFF") {
-  merged_df %>% filter(BZScore >= 3)
-} else {
-  merged_df %>% filter(ZScore >= 3)
-}
-
-hits_df2 <- hits_df %>%
-  left_join(
-    hits_df_qc %>% select(Plate, Well, Systematic_error, QC_alpha),
-    by = c("Plate", "Well")
-  )
-
-# (optional) make factors safe for Excel
-hits_df2 <- hits_df2 %>% mutate(across(where(is.factor), as.character))
-
-# 2) Load the existing workbook and overwrite the Hits sheet
-wb <- loadWorkbook(fileX)
-
-if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
-addWorksheet(wb, sheet_hits)
-
-
-#Order by BZ-Score (descending)
-hits_df2 <- hits_df2 %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
-
-writeData(wb, sheet_hits, hits_df2, startCol = 1, startRow = 1, colNames = TRUE)
-freezePane(wb, sheet_hits, firstActiveRow = 2)
-addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(hits_df2))
-
-saveWorkbook(wb, fileX, overwrite = TRUE)
 ```
 
 
@@ -2816,7 +2555,16 @@ worksheetOrder(wb) <- match(new_order, names(wb))
 
 saveWorkbook(wb, fileX, overwrite = TRUE)
 
+# 1. What is actually driving sig_cols_score?
+cat("sig_cols_score:", sig_cols_score, "\n")
+cat("sig_rows_score:", sig_rows_score, "\n")
 
+# 2. What does recurrence look like for N03?
+test_well_recurrence %>% summarize(mean(n_plates_as_hit))
+
+# 3. What's the actual threshold?
+cat("n plates:", n_distinct(df$Plate), "\n")
+cat("threshold:", max(2, ceiling(n_distinct(df$Plate) * well_recurrence_pct)), "\n")
 
 
 ```
