@@ -1222,15 +1222,16 @@ saveWorkbook(wb, file = export_File, overwrite = TRUE)
 # ------------- SETUP AND CONFIGURATION -------------
 # Disable scientific notation for better readability
 options(scipen = 999)
-
 # ============================================================================
 # CONDENSCREEN FIGURE GENERATION 
 # ============================================================================
 
 # ------------- DATA LOADING AND PREPARATION -------------
 # Load workbook from predefined location (assuming save_Location is defined elsewhere)
+export_File <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx"
 
 wb <- loadWorkbook(export_File)
+
 
 merged_df <- read.xlsx(wb, sheet = "Combined Analysis")
 
@@ -1240,18 +1241,17 @@ merged_df$Normalized_Effect <- as.numeric(merged_df$PercentEffect)
 merged_df <- merged_df[!as.character(merged_df$Plate) %in% c("45", "46", "47"), ]
 #EDIT: Change to location of a file linking compound/gene names to each well, if applicable, else comment out, and run the following 
 #############################################################
-
 template_location <- file.path(file_Location, "plateMap.xlsx")
-
 template_exists <- file.exists(template_location)
+
+# Define candidates outside the if/else so both branches can access them
+well_candidates   <- c("Well", "Well_Condition")
+ref_candidates    <- c("Reference", "Gene", "Compound")
+cas_candidates    <- c("CAS", "CAS.Number")
+smiles_candidates <- c("SMILES")
 
 if (template_exists) {
   template <- read.xlsx(template_location)
-  
-  well_candidates <- c("Well", "Well_Condition")
-  ref_candidates  <- c("Reference", "Gene", "Compound")
-  cas_candidates  <- c("CAS", "CAS.Number")
-  smiles_candidates <- c("SMILES")
   
   pick_first_existing <- function(df, candidates) {
     intersect(candidates, colnames(df))[1]
@@ -1264,39 +1264,37 @@ if (template_exists) {
   
   select_cols <- c(
     intersect("Plate", colnames(template)),
-    well_col,
-    ref_col,
-    cas_col,
-    smiles_col
+    well_col, ref_col, cas_col, smiles_col
   )
   select_cols <- select_cols[!is.na(select_cols)]
   
   template <- template %>%
     select(all_of(select_cols)) %>%
     rename(
-      Well      = any_of(well_candidates),
-      Reference = any_of(ref_candidates),
-      CAS       = any_of(cas_candidates)
+      Well = any_of(well_candidates),
+      CAS  = any_of(cas_candidates)
     )
-   
-  # If no Reference/Gene/Compound column existed, add numbered Reference column
-  if (!"Reference" %in% colnames(template)) {
-    template$Reference <- seq_len(nrow(template))
+  
+  existing_ref <- intersect(ref_candidates, colnames(template))[1]
+  if (!is.na(existing_ref)) {
+    template <- template %>% rename(Reference = all_of(existing_ref))
+  } else {
+    template$Reference <- sprintf("%03d", seq_len(nrow(template)))
   }
   
-  # Merge data with compound names
+  merged_df <- merged_df %>% select(-any_of(c("Reference", "Gene", "Compound", "SMILES")))
   merged_df <- merge(merged_df, template, by = c("Plate", "Well"))
   
 } else {
   message("plateMap.xlsx not found at ", template_location, " — skipping template merge.")
   
-  # Add numbered Reference column if none of the ref columns exist in merged_df
-  if (!any(c("Reference", "Gene", "Compound") %in% colnames(merged_df))) {
-    merged_df$Reference <- seq_len(nrow(merged_df))
+  existing_ref <- intersect(ref_candidates, colnames(merged_df))[1]
+  if (!is.na(existing_ref) && existing_ref != "Reference") {
+    merged_df$Reference <- merged_df[[existing_ref]]
+  } else if (is.na(existing_ref)) {
+    merged_df$Reference <- sprintf("%03d", seq_len(nrow(merged_df)))
   }
 }
-
-
 sheet_hits = "Hits"
 sheet_df = "Combined Analysis"
 merged_df <- merged_df[!is.na(merged_df$Reference), ]  # Keep only rows with reference names (compounds, genes, etc.)
@@ -1338,70 +1336,69 @@ saveWorkbook(wb, export_File, overwrite = TRUE)
 
 ```{r}
 #NORMALIZED SCORE PLOT:
-#------------------------------------------------------------------------------
+has_td_int = TRUE
+
 score_col <- if ("BZScore" %in% names(merged_df)) "BZScore" else "ZScore"
 
 merged_df <- merged_df %>%
   mutate(
     score_value = .data[[score_col]],
-
     bz_hit  = score_value >= 3,
-
-    td_ok   = if (has_td_int && "tdTomato_Diff" %in% names(.))
-                tdTomato_Diff >= -25
-              else TRUE,
-
+    td_ok   = if (has_td_int && "tdTomato_Diff" %in% names(.)) {
+                # passes if tdTomato drop is acceptable OR was flagged by residual method
+                (tdTomato_Diff >= -25) | (!is.na(residual))
+              } else {
+                TRUE  # no tdTomato data or not applicable — don't penalize
+              },
     viab_ok = if ("Viability" %in% names(.))
                 Viability >= -25
               else TRUE
   ) %>%
   select(-score_value)
 
-plot_normalized_score <- function(df, assay_type, image_path) {
 
+plot_normalized_score <- function(df, assay_type, image_path, has_td_int = TRUE) {
   score_col <- if (assay_type == "OFF") sym("BZScore") else sym("ZScore")
   label_y   <- if (assay_type == "OFF") "BZ-Score" else "Z-Score"
+  y_limits  <- c(min(merged_df[[score_col]]), max(merged_df[[score_col]]))
+  y_breaks  <- c(-4, -2, 0, 2, 4, 6, 8)
 
-  y_limits <- c(-4, 8)
-  y_breaks <- c(-4, -2, 0, 2, 4, 6, 8)
+  hits_df <- dplyr::filter(df, !!score_col >= 3)
+  bg_df   <- dplyr::filter(df, !!score_col < 3)
+
+  if (has_td_int) {
+    hits_df <- hits_df %>% mutate(pass = as.character(td_ok & viab_ok))
+  } else {
+    hits_df <- hits_df %>% mutate(pass = "TRUE")
+  }
 
   p <- ggplot(df, aes(x = paste0(Well, Plate), y = !!score_col)) +
-
-    # ---- background points (BZ < 3)
     geom_point(
-      data = dplyr::filter(df, !!score_col < 3),
-      color = "black",
-      size = 1,
-      alpha = 0.4,
+      data     = bg_df,
+      color    = "black",
+      size     = 1,
+      alpha    = 0.4,
       position = position_jitter(width = 0.3, height = 0)
     ) +
-
-    # ---- BZ >= 3 hits, colored by phenotype logic
-geom_point(
-  data = dplyr::filter(df, !!score_col >= 3),
-  alpha = 1
-) +
-scale_size_manual(values  = c("TRUE" = 2.6, "FALSE" = 2)) +
-guides(color = "none", size = "none") +
-  scale_color_manual(
-  values = c(
-    "TRUE"  = "red",
-    "FALSE" = "black"
-    )
-  ) +
-
-  #Optional: Change color based on effect
-    # scale_color_manual(
-    #   values = c(
-    #     green      = "green",
-    #     red        = "red",
-    #     purple     = "purple",
-    #     background = "black"
-    #   )
-    # ) +
-
-    geom_hline(yintercept = 2, linetype = "dashed", size = 1.5) +
-
+    geom_point(
+      data  = hits_df,
+      aes(color = pass, size = pass),
+      alpha = 1
+    ) +
+    scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+    scale_size_manual(values  = c("TRUE" = 2.6,   "FALSE" = 2)) +
+    geom_hline(yintercept = 2, linetype = "dashed", linewidth = 1.5) +
+    geom_text_repel(
+      data          = hits_df,
+      aes(label     = Reference),
+      size          = 4.5,
+      fontface      = "bold",
+      box.padding   = 0.4,
+      point.padding = 0.3,
+      max.overlaps  = Inf
+    ) +
+    scale_y_continuous(limits = y_limits, breaks = y_breaks) +
+    coord_cartesian(ylim = y_limits) +
     theme_classic() +
     theme(
       axis.text.x  = element_blank(),
@@ -1409,46 +1406,32 @@ guides(color = "none", size = "none") +
       axis.text.y  = element_text(size = 18, face = "bold"),
       axis.title.y = element_text(size = 24, face = "bold"),
       axis.title.x = element_text(size = 24, face = "bold")
-
     ) +
-
-    labs(
-  x = "Compound",
-  y = label_y
-    )+
-    scale_y_continuous(limits = y_limits, breaks = y_breaks) +
-    guides(color = "none") +
-    coord_cartesian(ylim = y_limits) +
-    geom_text_repel(
-  data = dplyr::filter(df, !!score_col >= 3),
-  aes(label = Reference),
-  size = 4.5,
-  fontface = "bold",
-  box.padding = 0.4,
-  point.padding = 0.3,
-  max.overlaps = Inf
-)
+    labs(x = "Compound", y = label_y) +
+    guides(color = "none", size = "none")
 
   ggsave(
     filename = paste0(image_path, "normalized_SigScoreTdTomatoScreen.pdf"),
-    plot = p,
-    dpi = 300,
-    width = 10,
-    height = 10
+    plot     = p,
+    dpi      = 300,
+    width    = 10,
+    height   = 10
   )
 
   return(p)
 }
 
+plot_normalized_score(merged_df, assayType, image_Save_Location, has_td_int = has_td_int)
 
-plot_normalized_score(merged_df, assayType ,image_Save_Location)
-
+image_Save_Location = file_Location
 ```
+
+
 
 ```{r}
 #DISTRIBUTION PLOTS
 #------------------------------------------------------------------------------
-
+ 
 #RAW DISTRIBUTION
 # Create histogram of raw foci per cell
   raw_distribution <- ggplot(merged_df, aes(x = AvgFoci)) +
@@ -1507,8 +1490,7 @@ normalized_dist <- normalized_dist +
         width = 10, 
         height = 10)
   
-
-  
+   
 ```
 
 
