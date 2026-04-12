@@ -24,17 +24,18 @@ desired_cols <- c(
   "ObjectNumber",
   "FileName_GFP",
   "AreaShape_Area",
-  "Intensity_IntegratedIntensity_tdTomato",
+  "AreaShape_FormFactor",
+  "Intensity_IntegratedIntensity_P2A_tdTomato",
   "Children_GFP_foci_Count"
 )
 
-numeric_optional <- c("AreaShape_Area", "Intensity_IntegratedIntensity_tdTomato")
+numeric_optional <- c("AreaShape_Area","AreaShape_FormFactor", "Intensity_IntegratedIntensity_P2A_tdTomato")
 
 batch_data <- lapply(batch_paths, function(path) {
-  header_cols  <- names(fread(path, nrows = 0))
+  header_cols  <- names(fread(path, nrows = 0, skip = 1))
   cols_to_read <- intersect(desired_cols, header_cols)
   
-  dt <- fread(path, select = cols_to_read, header = TRUE)
+  dt <- fread(path, select = cols_to_read, header = TRUE, skip = 1)
   
   # Ensure optional numeric columns exist and are numeric
   for (col in numeric_optional) {
