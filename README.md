@@ -2,11 +2,14 @@
 
 ## High-Throughput Image Analysis and Statistical Pipeline for Quantifying Condensates
 
-![CondenScreen Logo](.Demo/images/condenscreenLogo.png)
-
 **CondenScreen** is a robust, open-source pipeline developed to analyze condensate phenotypes in immunofluorescence images. Developed by the Schlieker Lab, the program leverages [CellProfiler 4.2.6] for image segmentation and R for statistical analysis. 
 
+<div align="center">
+  <img src="Demo/images/condenscreenLogo.png" width="300" />
+</div>
+
 #### Version 1.3
+
 ---
 
 ## Overview
