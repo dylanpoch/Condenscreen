@@ -537,6 +537,7 @@ process_batch <- function(batch_row, file_Location) {
 # (i.e. before dfSelection itself has been loaded) reuses this same value
 # instead of re-hardcoding the path.
 project_data_dir <- "/home/userX/pathsource/"
+
 save_Location <- project_data_dir
 file_Location <- save_Location
 #############################################################
@@ -586,83 +587,33 @@ ChemVGene <- dfSelection$ScreenType[1]
 #Change recursive = TRUE to FALSE if you don't wish to search through all sub-directories of your current directory
 #############################################################
 script_path <- file.path(file_Location, "process_batch.R")
+# ── Read merged per-batch files directly (two-row CellProfiler header) ────────
+# Each file already has Nuclei + GFP + tdTomato + WholeCell columns combined,
+# so there's no per-channel classification or merge step needed -- just read
+# and stack the batches.
 
-# ── Build manifest ────────────────────────────────────────────────────────────
-all_files <- data.table(
-  path = list.files(file_Location, pattern = "CondenScreen.*\\.csv$",
-                    full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
-)
+read_merged_batch <- function(path) {
+  hdr <- fread(path, header = FALSE, nrows = 2)
+  # Combine object name (row 1) + measurement name (row 2) so columns that
+  # share a measurement name across objects (e.g. AreaShape_Area under both
+  # Nuclei and expanded_Nuclei) don't collide.
+  full_names <- paste(unlist(hdr[1, ]), unlist(hdr[2, ]), sep = "_")
 
-all_files[, batch := as.integer(stringr::str_extract(basename(path), "(?<=Batch_)\\d+"))]
-all_files[, type  := fcase(
-  grepl("Nuclei",    basename(path), ignore.case = TRUE), "Nuc",
-  grepl("tdTomato",  basename(path), ignore.case = TRUE), "tdTomato",
-  grepl("WholeCell", basename(path), ignore.case = TRUE), "Cyto",
-  grepl("GFP_foci",  basename(path), ignore.case = TRUE), "GFP",
-  default = NA_character_
-)]
-all_files <- all_files[!is.na(type) & !is.na(batch)]
-
-# Deduplicate: same batch+type appearing in multiple folders -- keep first
-dups <- all_files[, .N, by = .(batch, type)][N > 1]
-if (nrow(dups) > 0) {
-  print(dups)
-  warning("Duplicate batch+type combinations found -- keeping first match only")
-  all_files <- all_files[, .SD[1], by = .(batch, type)]
+  dt <- fread(path, skip = 2, header = FALSE)
+  setnames(dt, full_names)
+  dt[, batch := as.integer(stringr::str_extract(basename(path), "(?<=Batch_)\\d+"))]
+  dt
 }
 
-manifest <- as.data.table(dcast(all_files, batch ~ type, value.var = "path"))
+batch_files <- list.files(file_Location, pattern = "CondenScreen.*Batch_\\d+\\.csv$",
+                          full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
+stopifnot(length(batch_files) > 0)
+cat("Found", length(batch_files), "batch files\n")
 
-# Ensure path columns are plain character, not list-cols
-for (col in intersect(c("Nuc", "Cyto", "GFP", "tdTomato"), names(manifest))) {
-  manifest[, (col) := as.character(get(col))]
-}
-manifest[, batch := as.integer(batch)]
-
-manifest[, complete := !is.na(Nuc)]
-incomplete <- manifest[complete == FALSE]
-if (nrow(incomplete) > 0)
-  warning("Batches missing Nuc file (skipping): ", paste(incomplete$batch, collapse = ", "))
-manifest <- manifest[complete == TRUE]
-
-cat("Manifest built:", nrow(manifest), "batches\n")
-stopifnot(nrow(manifest) > 0)
-
-
-#----------------------
-#REMOVE UNLESS ONLY RUNNING FIRST THREE BATCHES:
-#manifest <- head(manifest, 3)
-#----------------------
-
-# ── Dispatch (in-process, Option B) ──────────────────────────────────────────
-# SPEED: let data.table use every available core for fread/fwrite parsing.
-data.table::setDTthreads(0L)  # 0 = use all logical cores
-
-for (i in seq_len(nrow(manifest))) {
-  process_batch(manifest[i], file_Location)
-  gc()
-}
-
-# ── Reassemble ────────────────────────────────────────────────────────────────
-cat("All batches completed. Combining results...\n")
-
-
-
-#-------------------
-#SWITCH ONLY TO FILE.PATH IF RUNNING FIRST 3 BATCHES!!
-#batch_files   <- list.files(file_Location, pattern = "^batch_\\d+\\.csv$", full.names = TRUE)
-batch_files <- file.path(file_Location, paste0("batch_", manifest$batch, ".csv"))
-
-#-------------------
-
-
-
-
-combined_data <- rbindlist(lapply(batch_files, fread, showProgress = FALSE), fill = TRUE)
+combined_data <- rbindlist(lapply(batch_files, read_merged_batch), fill = TRUE)
 fwrite(combined_data, file.path(file_Location, "final_combined_result.csv"), na = "")
 cat("Combined:", nrow(combined_data), "rows across", length(batch_files), "batches\n")
-
-
+ 
 ```
 
 ```{r}
@@ -1886,6 +1837,8 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
   }
 }
  
+score_col <- if ("BZScore" %in% names(merged_df)) "BZScore" else "ZScore"
+ 
 merged_df <- merged_df %>%
   mutate(
     score_value = .data[[score_col]],
@@ -3040,10 +2993,7 @@ df_final <- df_hits %>%
   select(-ends_with(".old")) %>%
   mutate(
     Viability = if ("Viability" %in% names(.)) Viability else NA_real_,
-    # NOTE: named SecondaryMarkerFlag (not SecondaryMarker) -- df_hits may still
-    # carry the raw mean-intensity SecondaryMarker column from earlier in the
-    # pipeline, and this boolean must not silently overwrite it.
-    SecondaryMarkerFlag = if ("SecondaryMarker_Diff" %in% names(.)) {
+    SecondaryMarker = if ("SecondaryMarker_Diff" %in% names(.)) {
     SecondaryMarker_Diff <= -25 &
       if ("residual" %in% names(.)) is.na(residual) else TRUE
   } else FALSE,
@@ -3057,7 +3007,7 @@ df_final <- df_hits %>%
     # --- Flag categories ---
     High_Flag = grepl("PAINS", flags, ignore.case = TRUE) | Cytotoxic,
  
-    Moderate_Flag = grepl("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE) | SecondaryMarkerFlag,
+    Moderate_Flag = grepl("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE) | SecondaryMarker,
  
     Mild_Flag = grepl("INPHARMATICA|SURECHEMBL", flags, ignore.case = TRUE) |
                 (!is.na(Lipinski_Failed) & Lipinski_Failed > 0),
@@ -3100,7 +3050,7 @@ df_final <- df_final %>%
     "BZScore", "ZScore", "BScore", "PercentEffect",
     "Viability", "Risk", "PlateZPrimeScore", "Systematic_error", "QC_alpha",
     "AvgFoci", "Average_foci_perCell", "CellCount", "CellCountPercentDiff",
-    "AssayType", "SecondaryMarkerFlag", "residual", "Cytotoxic",
+    "AssayType", "SecondaryMarker", "residual", "Cytotoxic",
     "CAS", "SMILES_used", "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
     "AlertScore", "alert_flags"
   )))
@@ -3163,8 +3113,8 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 # ── Restrict Tanimoto/cheminformatics analysis to confirmed hits ────────────────
 # Only compounds with BZ/Z-Score > 3 that pass viability (Viability >= -50) and,
 # if a secondary marker channel exists, pass the secondary marker filter. This mirrors the
-# viab_ok / secondary_marker_ok conventions used elsewhere (SecondaryMarkerFlag here is the
-# "failed" drop flag, so passing == !SecondaryMarkerFlag).
+# viab_ok / secondary_marker_ok conventions used elsewhere (SecondaryMarker here is the "failed"
+# drop flag, so passing == !SecondaryMarker).
 # Reuses the GUI-derived score_col when this chunk is run in the same session as
 # the rest of the pipeline; falls back to data-presence detection for a
 # standalone restart where only df_final was reloaded from disk.
@@ -3174,7 +3124,7 @@ df_chem <- df_final %>%
   filter(
     .data[[score_col_chem]] > 3,
     is.na(Viability) | Viability >= -50,
-    if (has_secondary_marker && "SecondaryMarkerFlag" %in% names(.)) (is.na(SecondaryMarkerFlag) | !SecondaryMarkerFlag) else TRUE
+    if (has_secondary_marker && "SecondaryMarker" %in% names(.)) (is.na(SecondaryMarker) | !SecondaryMarker) else TRUE
   )
  
 message("Cheminformatics: ", nrow(df_chem), " of ", nrow(df_final),
@@ -3682,7 +3632,7 @@ if (exists("export_hits_df") && exists("fileX") && file.exists(fileX)) {
       mutate(across(where(is.factor), as.character)) %>%
       select(any_of(c("Plate", "Well", "Risk", "AlertScore", "alert_flags",
                        "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
-                       "CAS", "SMILES_used", "SecondaryMarkerFlag", "Cytotoxic"))) %>%
+                       "CAS", "SMILES_used", "SecondaryMarker", "Cytotoxic"))) %>%
       distinct(Plate, Well, .keep_all = TRUE)
   } else {
     tibble::tibble(Plate = character(), Well = character())
