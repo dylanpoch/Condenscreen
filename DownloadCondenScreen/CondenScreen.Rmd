@@ -17,9 +17,7 @@ required_packages <- c("tidyverse", "knitr", "DBI", "ggpval", "openxlsx",
                        "ggrepel", "data.table", "progress", "shiny", "plotly",
                        "htmltools", "sass", "rlang", "gridExtra", "ggplate",
                        "writexl", "httr2", "reticulate", "jsonlite", "patchwork", 
-                       "pheatmap", "igraph", "ggraph", "umap", "reshape2", "dplyr",
-                       "patchwork", "magick")
-
+                       "pheatmap", "igraph", "ggraph", "umap", "reshape2", "magick")
 
 installed <- rownames(installed.packages())
 
@@ -2610,7 +2608,6 @@ cluster_summary <- component_df %>%
 
 # ── IMAGE 6: Grouped structure grid ───────────────────────────────────────────
 # ── IMAGE 6: One row per cluster, structures + text separated via magick ───────
-library(magick)
 
 groups_unique <- sort(unique(component_df$Group))
 
