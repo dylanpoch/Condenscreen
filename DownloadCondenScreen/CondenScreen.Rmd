@@ -17,7 +17,9 @@ required_packages <- c("tidyverse", "knitr", "DBI", "ggpval", "openxlsx",
                        "ggrepel", "data.table", "progress", "shiny", "plotly",
                        "htmltools", "sass", "rlang", "gridExtra", "ggplate",
                        "writexl", "httr2", "reticulate", "jsonlite", "patchwork", 
-                       "pheatmap", "igraph", "ggraph", "umap", "reshape2", "magick")
+                       "pheatmap", "igraph", "ggraph", "umap", "reshape2", "dplyr",
+                       "patchwork", "magick")
+
 
 installed <- rownames(installed.packages())
 
@@ -313,8 +315,152 @@ server <- function(input, output, session) {
 # Run app
 shinyApp(ui = ui, server = server)
 
-fread("/Users/dylan/Downloads/chemdiver/CondenScreenCombined_CondenScreen_Batch_2.csv")
 ```
+
+
+```{r}
+process_batch <- function(batch_row, file_Location) {
+  batch_number <- batch_row$batch[[1]]
+
+  # ── Column definitions ──────────────────────────────────────────────────────
+  Nuc_cols <- c("ImageNumber", "ObjectNumber",
+                "AreaShape_Area", "AreaShape_FormFactor",
+                "PathName_DAPI", "FileName_DAPI")
+  
+  tdTomato_cols <- c("ImageNumber", "ObjectNumber",
+                     "Intensity_IntegratedIntensity_tdTomato",
+                     "Intensity_MeanIntensity_tdTomato")
+  
+  Cyto_cols <- c("ImageNumber", "ObjectNumber",
+                 "Intensity_IntegratedIntensity_GFP",
+                 "Intensity_MeanIntensity_GFP")
+  
+  GFP_cols <- c("ImageNumber", "ObjectNumber",
+                "AreaShape_Area", "AreaShape_Compactness",
+                "Intensity_IntegratedIntensity_GFP", "Intensity_MeanIntensity_GFP",
+                "Parent_WholeCell", "Parent_nuclear_periphery")
+  
+  # ── Safe loader ─────────────────────────────────────────────────────────────
+  safe_fread <- function(path, cols) {
+    path <- as.character(path[[1]])  # force scalar character regardless of list/vector
+    if (length(path) == 0 || is.na(path) || path == "NA" || !file.exists(path)) return(NULL)
+    # SPEED: probe only the header (nrows = 0) so the second read pulls just the
+    # needed columns off disk; showProgress = FALSE removes per-file console overhead.
+    avail <- names(fread(path, nrows = 0, showProgress = FALSE))
+    fread(path, select = intersect(cols, avail), showProgress = FALSE)
+  }
+  # ── Load ────────────────────────────────────────────────────────────────────
+  df_Nuc      <- safe_fread(batch_row$Nuc,      Nuc_cols)
+  df_tdTomato <- safe_fread(batch_row$tdTomato, tdTomato_cols)
+  df_Cyto     <- safe_fread(batch_row$Cyto,     Cyto_cols)
+  df_GFP      <- safe_fread(batch_row$GFP,      GFP_cols)
+  
+  if (is.null(df_Nuc)) {
+    warning("Nuclei file missing for batch ", batch_number, " -- skipping")
+    return(invisible(NULL))
+  }
+  
+  # ── Rename nucleus columns ──────────────────────────────────────────────────
+  setnames(df_Nuc,
+           c("AreaShape_Area", "AreaShape_FormFactor"),
+           c("Nuc_Area", "Nuc_FormFactor"))
+  
+  # ── GFP foci aggregation ────────────────────────────────────────────────────
+  if (!is.null(df_GFP)) {
+    
+    df_GFP <- df_GFP[Parent_WholeCell != 0]
+    has_nuc_periphery <- "Parent_nuclear_periphery" %in% names(df_GFP)
+    
+    if (!is.null(df_Cyto) && "Parent_WholeCell" %in% names(df_GFP)) {
+      parent_key <- "Parent_WholeCell"
+      if (has_nuc_periphery) {
+        df_GFP[, NucFoci  := as.integer(Parent_nuclear_periphery != 0)]
+        df_GFP[, CytoFoci := as.integer(Parent_nuclear_periphery == 0)]
+      } else {
+        df_GFP[, NucFoci  := NA_integer_]
+        df_GFP[, CytoFoci := NA_integer_]
+      }
+    } else if (has_nuc_periphery) {
+      df_GFP     <- df_GFP[Parent_nuclear_periphery != 0]
+      parent_key <- "Parent_nuclear_periphery"
+      df_GFP[, NucFoci  := 1L]
+      df_GFP[, CytoFoci := NA_integer_]
+    } else {
+      parent_key <- "Parent_WholeCell"
+      df_GFP[, NucFoci  := NA_integer_]
+      df_GFP[, CytoFoci := NA_integer_]
+    }
+    
+    # Which per-focus measurement columns are actually present (failsafe if a
+    # CellProfiler export is missing one). Booleans are captured by the data.table
+    # j-expression below; the unused if-branch is never evaluated, so a missing
+    # column is never referenced.
+    has_fa <- "AreaShape_Area"                    %in% names(df_GFP)
+    has_compact <- "AreaShape_Compactness"              %in% names(df_GFP)
+    has_ii <- "Intensity_IntegratedIntensity_GFP" %in% names(df_GFP)
+    has_mi <- "Intensity_MeanIntensity_GFP"       %in% names(df_GFP)
+
+    # Per whole-cell aggregation. Morphology (size, form factor, integrated/mean
+    # intensity) is computed over NUCLEAR foci only (which(NucFoci == 1) drops NAs);
+    # cytoplasmic foci contribute a count and a TOTAL integrated-intensity sum.
+    df_GFP_agg <- df_GFP[, {
+      ni         <- which(NucFoci  == 1L)              # nuclear-foci row indices (NA-safe)
+      cyto_known <- !all(is.na(CytoFoci))              # can we distinguish cyto foci at all?
+      ci         <- if (cyto_known) which(CytoFoci == 1L) else integer(0)
+      list(
+        NucFoci  = length(ni),
+        CytoFoci = if (cyto_known) length(ci) else NA_integer_,
+        Avg_NucFoci_Area                   = if (has_fa && length(ni)) mean(AreaShape_Area[ni],                    na.rm = TRUE) else NA_real_,
+        Avg_NucFoci_Compactness             = if (has_compact && length(ni)) mean(AreaShape_Compactness[ni],              na.rm = TRUE) else NA_real_,
+        Avg_NucFoci_IntegratedIntensity    = if (has_ii && length(ni)) mean(Intensity_IntegratedIntensity_GFP[ni], na.rm = TRUE) else NA_real_,
+        Avg_NucFoci_Intensity              = if (has_mi && length(ni)) mean(Intensity_MeanIntensity_GFP[ni],       na.rm = TRUE) else NA_real_,
+        Total_CytoFoci_IntegratedIntensity = if (has_ii && cyto_known) sum(Intensity_IntegratedIntensity_GFP[ci],  na.rm = TRUE) else NA_real_
+      )
+    }, by = .(ObjectNumber = get(parent_key), ImageNumber)]
+  } else {
+    df_GFP_agg <- NULL
+  }
+  
+  # ── Rename Cyto columns ─────────────────────────────────────────────────────
+  if (!is.null(df_Cyto)) {
+    setnames(df_Cyto,
+             c("Intensity_IntegratedIntensity_GFP", "Intensity_MeanIntensity_GFP"),
+             c("IntegratedIntensity_CytoplasmGFP",  "MeanIntensity_CytoplasmGFP"))
+  }
+  
+  # ── Set keys ────────────────────────────────────────────────────────────────
+  key_cols <- c("ImageNumber", "ObjectNumber")
+  for (dt in list(df_Nuc, df_Cyto, df_tdTomato, df_GFP_agg)) {
+    if (!is.null(dt)) setkeyv(dt, key_cols)
+  }
+  
+  # ── Merge ───────────────────────────────────────────────────────────────────
+  df_merge <- copy(df_Nuc)
+  
+  if (!is.null(df_Cyto)) {
+    df_merge <- merge(df_merge, df_Cyto, by = key_cols, all.x = TRUE)
+  }
+  if (!is.null(df_GFP_agg)) {
+    df_merge <- merge(df_merge, df_GFP_agg, by = key_cols, all.x = TRUE)
+    if ("NucFoci"  %in% names(df_merge)) df_merge[is.na(NucFoci),  NucFoci  := 0L]
+    if ("CytoFoci" %in% names(df_merge)) df_merge[is.na(CytoFoci), CytoFoci := 0L]
+  }
+  if (!is.null(df_tdTomato)) {
+    df_merge <- merge(df_merge, df_tdTomato, by = key_cols, all.x = TRUE)
+  }
+  
+  # ── Option B: write to disk, free RAM ───────────────────────────────────────
+  output_file <- file.path(file_Location, paste0("batch_", batch_number, ".csv"))
+  fwrite(df_merge, output_file, na = "")
+  cat("Batch", batch_number, "-- wrote", nrow(df_merge), "rows\n")
+  
+  return(invisible(NULL))  # no return value; output is on disk
+}
+
+
+```
+
+
 
 
 ```{r}
@@ -322,7 +468,7 @@ fread("/Users/dylan/Downloads/chemdiver/CondenScreenCombined_CondenScreen_Batch_
 #############################################################  
 #Make sure all pathways use foward slash (/)!
 #save_Location <- "/home/userX/pathsource/"
-save_Location <-"/Users/dylan/Downloads/chemdiver/"
+save_Location <-"/nfs/roberts/scratch/pi_cs723/djp94/YCMD/UseChemicalDiversityAll/"
 file_Location<- save_Location
 #############################################################
 
@@ -356,128 +502,181 @@ ChemVGene <- dfSelection$ScreenType[1]
 #UNLESS CHANGED FILENAME PATTERNS IN CELLPROFILER, LEAVE AS IS:
 #Change recursive = TRUE to FALSE if you don't wish to search through all sub-directories of your current directory
 #############################################################
-
-#file_paths <- dir(file_Location, pattern = "*.FociQuant.*", full.names = TRUE, recursive = TRUE)
-file_paths <- list.files(file_Location, pattern="CondenScreenCombined", full.names=TRUE, recursive=TRUE, ignore.case=TRUE)
-
-#############################################################
-
-# Check if the file exists
-path_to_batchScript <- paste0(file_Location, "process_batch.R")
-
-if (file.exists(path_to_batchScript)) {
-  cat("The batch script exists. Success!\n")
-} else {
-  cat("The batch script file does not exist. Try downloading directly into your selected file_Location \n")
-}
-
-# Save file paths to disk so each batch can access them
-saveRDS(file_paths, file.path(file_Location, "file_paths.rds"))
-
-batch_size <- 20
-total_files <- length(file_paths)
-stopifnot(total_files > 0)  # fail early instead of launching nothing
-
-total_batches <- ceiling(total_files / batch_size)
-
 script_path <- file.path(file_Location, "process_batch.R")
-stopifnot(file.exists(script_path))
 
-for (i in 1:total_batches) {
-  start_idx <- (i - 1) * batch_size + 1
-  end_idx   <- min(i * batch_size, total_files)
-
-  cat("Launching batch", i, "of", total_batches, "\n")
-
-res <- system2(
-  command = "Rscript",
-  args = c(
-    shQuote(script_path),
-    start_idx,
-    end_idx,
-    i,
-    shQuote(file.path(file_Location, "file_paths.rds")),
-    shQuote(file_Location)
-  ),
-  stdout = TRUE,
-  stderr = TRUE
+# ── Build manifest ────────────────────────────────────────────────────────────
+all_files <- data.table(
+  path = list.files(file_Location, pattern = "CondenScreen.*\\.csv$",
+                    full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
 )
 
-cat(paste(res, collapse="\n"))
+all_files[, batch := as.integer(stringr::str_extract(basename(path), "(?<=Batch_)\\d+"))]
+all_files[, type  := fcase(
+  grepl("Nuclei",    basename(path), ignore.case = TRUE), "Nuc",
+  grepl("tdTomato",  basename(path), ignore.case = TRUE), "tdTomato",
+  grepl("WholeCell", basename(path), ignore.case = TRUE), "Cyto",
+  grepl("GFP_foci",  basename(path), ignore.case = TRUE), "GFP",
+  default = NA_character_
+)]
+all_files <- all_files[!is.na(type) & !is.na(batch)]
 
+# Deduplicate: same batch+type appearing in multiple folders -- keep first
+dups <- all_files[, .N, by = .(batch, type)][N > 1]
+if (nrow(dups) > 0) {
+  print(dups)
+  warning("Duplicate batch+type combinations found -- keeping first match only")
+  all_files <- all_files[, .SD[1], by = .(batch, type)]
+}
+
+manifest <- as.data.table(dcast(all_files, batch ~ type, value.var = "path"))
+
+# Ensure path columns are plain character, not list-cols
+for (col in intersect(c("Nuc", "Cyto", "GFP", "tdTomato"), names(manifest))) {
+  manifest[, (col) := as.character(get(col))]
+}
+manifest[, batch := as.integer(batch)]
+
+manifest[, complete := !is.na(Nuc)]
+incomplete <- manifest[complete == FALSE]
+if (nrow(incomplete) > 0)
+  warning("Batches missing Nuc file (skipping): ", paste(incomplete$batch, collapse = ", "))
+manifest <- manifest[complete == TRUE]
+
+cat("Manifest built:", nrow(manifest), "batches\n")
+stopifnot(nrow(manifest) > 0)
+
+
+#----------------------
+#REMOVE UNLESS ONLY RUNNING FIRST THREE BATCHES:
+#manifest <- head(manifest, 3)
+#----------------------
+
+# ── Dispatch (in-process, Option B) ──────────────────────────────────────────
+# SPEED: let data.table use every available core for fread/fwrite parsing.
+data.table::setDTthreads(0L)  # 0 = use all logical cores
+
+for (i in seq_len(nrow(manifest))) {
+  process_batch(manifest[i], file_Location)
   gc()
 }
- 
-# After all batches are done, combine if needed
+
+# ── Reassemble ────────────────────────────────────────────────────────────────
 cat("All batches completed. Combining results...\n")
 
-# List all batch files
-batch_files <- list.files(file_Location, 
-                         pattern = "^batch_\\d+\\.csv$",
-                         full.names = TRUE)
-# Combine all batches into a final result
-combined_data <- rbindlist(lapply(batch_files, fread))
-fwrite(combined_data, paste0(file_Location, "final_combined_result.csv"))
-
-cat("Processing complete!\n")
 
 
-#Note: Will create tdTomato and Area columns even if empty for consistent DataFrame formatting
+#-------------------
+#SWITCH ONLY TO FILE.PATH IF RUNNING FIRST 3 BATCHES!!
+#batch_files   <- list.files(file_Location, pattern = "^batch_\\d+\\.csv$", full.names = TRUE)
+batch_files <- file.path(file_Location, paste0("batch_", manifest$batch, ".csv"))
 
-combined_data <- rbindlist(lapply(batch_files, fread), fill = TRUE)
+#-------------------
 
-# --- Make tdTomato/Area optional but stable (always present, always numeric) ---
-ensure_numeric <- function(DT, col) {
-  if (!col %in% names(DT)) DT[, (col) := NA_real_]
-  DT[, (col) := suppressWarnings(as.numeric(get(col)))]
-  invisible(NULL)
-}
 
-ensure_numeric(combined_data, "Intensity_IntegratedIntensity_P2A_tdTomato")
-ensure_numeric(combined_data, "AreaShape_Area_P2A_tdTomato")
 
-has_td_int  <- "Intensity_IntegratedIntensity_P2A_tdTomato" %in% names(combined_data) &&
-               any(!is.na(combined_data$Intensity_IntegratedIntensity_P2A_tdTomato))
-has_td_area <- "AreaShape_Area_P2A_tdTomato_P2A_tdTomato" %in% names(combined_data) &&
-               any(!is.na(combined_data$AreaShape_Area_P2A_tdTomato_P2A_tdTomato))
 
-has_td <- has_td_int || has_td_area
+combined_data <- rbindlist(lapply(batch_files, fread, showProgress = FALSE), fill = TRUE)
+fwrite(combined_data, file.path(file_Location, "final_combined_result.csv"), na = "")
+cat("Combined:", nrow(combined_data), "rows across", length(batch_files), "batches\n")
+
+# ── tdTomato presence flags (for downstream use) ──────────────────────────────
+has_tdTomato <- "Intensity_IntegratedIntensity_tdTomato" %in% names(combined_data) &&
+                any(!is.na(combined_data$Intensity_IntegratedIntensity_tdTomato))
+
 
 ```
 
+```{r}
+cat("Class:", class(manifest), "\n")
+cat("Columns:", names(manifest), "\n")
+print(head(manifest, 10))
+ 
+```
 
 ```{r}
 # STRING EXTRACTION FOR WELL/PLATE NAMING CONVENTIONS 
 
-# Vectorized version
+# Vectorized version — plate id from the PATH (PathName_*), well/site from the FILE name (FileName_*).
+# Accepts BOTH folder layouts (barcode before OR after Plate_<n>) and names DP plates "DP-<n>".
 extract_info_vectorized <- function(combinedDF) {
-  
-  # Define patterns
-#================================================================
-  pattern_filename <- "([A-Za-z0-9]+)_([A-Za-z0-9]+)_s(\\d+)_w\\d+"
-  pattern_pathname <- "\\d{8}-([A-Za-z0-9]+)_Plate_\\d+"
-#================================================================
-  # Extract all matches at once using vectorized operations
-  matches <- str_match(combinedDF$FileName_GFP, pattern_filename)
-  
-  # Initialize result tibble with extracted values
-  result <- tibble(
-    plate_Num = matches[, 2],
-    Well_Num = matches[, 3],
-    Image_Num = matches[, 4]
-  )
-  
-  return(result)
+
+  # Plate id lives in the folder PATH; well/site live in the FILE name. Need BOTH columns.
+  path_col <- intersect(c("PathName_DAPI","PathName_GFP","PathName_WholeCell","PathName_tdTomato",
+                          grep("^PathName_", names(combinedDF), value = TRUE)), names(combinedDF))[1]
+  file_col <- intersect(c("FileName_DAPI","FileName_GFP","FileName_WholeCell","FileName_tdTomato",
+                          grep("^FileName_", names(combinedDF), value = TRUE)), names(combinedDF))[1]
+  if (is.na(path_col)) stop("No PathName_* column found (needed for plate id).")
+  if (is.na(file_col)) stop("No FileName_* column found (needed for well/site).")
+
+  path <- combinedDF[[path_col]]
+  file <- combinedDF[[file_col]]
+
+  # Well + site from the FILE name:  ..._B01_s2_w1.TIF  -> well B01, site 2
+  well <- str_match(file, "([A-Za-z0-9]+)_s(\\d+)_w\\d+")[, 2]
+  site <- str_match(file, "_s(\\d+)_w\\d+")[, 2]
+
+  # Plate id from the PATH's "..._Plate_<digits>..." folder. Strip the leading 8-digit
+  # date and the Plate_<number> token; the alphanumeric remainder is the barcode.
+  #   20260217_Plate_11950_A21252  -> A21252   (barcode AFTER plate number)
+  #   20251020-A21053_Plate_11611  -> A21053   (barcode BEFORE plate number)
+  #   20251027-DP-46_Plate_11640   -> DP-46
+  plate_dir <- str_match(path, "([^/]*Plate_\\d+[^/]*)")[, 2]
+  barcode   <- plate_dir
+  barcode   <- sub("^\\d{8}[-_]", "",  barcode)     # drop leading date + separator
+  barcode   <- sub("_?Plate_\\d+_?", "_", barcode)  # remove the Plate_<number> token
+  barcode   <- gsub("(^_+|_+$)", "",   barcode)     # trim stray underscores
+  barcode   <- ifelse(is.na(barcode) | barcode == "", NA_character_, barcode)
+
+  # DP plates -> "DP-<number>" (per request)
+  dp    <- str_match(plate_dir, "(?:^|[^A-Za-z])DP[-_ ]?(\\d+)")[, 2]
+  plate <- ifelse(!is.na(dp), paste0("DP-", dp), barcode)
+
+  tibble(plate_Num = plate, Well_Num = well, Image_Num = site)
 }
 
+# Apply
+# Apply — parse ONCE per unique image (path+file), then join back to every cell.
+# Running str_match on the full per-cell table (tens of millions of rows) is what hung.
+key <- intersect(c("PathName_DAPI", "FileName_DAPI"), names(combined_data))
+u   <- unique(combined_data[, ..key])                       # ~#images, not #cells
+u[, c("plate_Num", "Well_Num", "Imagecopy_Num") := extract_info_vectorized(u)]
 
-# Apply the vectorized function directly to the dataframe
-extractedInfo <- extract_info_vectorized(combined_data)
+combined_data[u, on = key,
+  `:=`(plate_Num     = i.plate_Num,
+       Well_Num      = i.Well_Num,
+       Imagecopy_Num = i.Imagecopy_Num)]
 
-combined_data[, c("plate_Num", "Well_Num", "Imagecopy_Num") := extractedInfo]
+# ── Un-parseable A-plate files (computed on the small unique table) ───────────
+.unclean   <- is.na(u$plate_Num) | is.na(u$Well_Num) | is.na(u$Imagecopy_Num)
+.is_Aplate <- (grepl("^A", u$plate_Num) %in% TRUE) | grepl("[-_]A\\d{4,}", u$PathName_DAPI)
+unparsed_A_plates <- unique(u[.unclean & .is_Aplate,
+                              .(FileName_DAPI, PathName_DAPI, plate_Num, Well_Num, Imagecopy_Num)])
+cat("Un-parseable A-plate files:", nrow(unparsed_A_plates), "\n")
+
+#-----------------------------------------------------------------------------
+#Normally remove:
+#-----------------------------------------------------------------------------
+#To replace the plates with DP-X, use the following map, note: must check that these pairings are accurate since this is all based on relative increase to plate/DP numbers:
+# Map DP-X placeholder IDs to their corresponding A-numbers
+
+ 
+dp_map <- c(
+  "DP-41" = "A21060", "DP-42" = "A21061", "DP-43" = "A21062", "DP-44" = "A21063",
+  "DP-45" = "A21064", "DP-46" = "A21065", "DP-47" = "A21066", "DP-48" = "A21067"
+)
+
+combined_data$plate_Num <- ifelse(combined_data$plate_Num %in% names(dp_map),
+                                   dp_map[combined_data$plate_Num], combined_data$plate_Num)
+
+
+#-----------------------------------------------------------------------------
+
+
 
 combined_Df <- combined_data
+ 
 
+unique(combined_Df$plate_Num)
 
 ```
 
@@ -487,8 +686,50 @@ combined_Df <- combined_data
 #------------------------------------------------------------------------------
 #[OPTIONAL] Filter out bottom 75% (to control for a transfection efficiency of 1:4)
 #Filter conditions that leave < 5 cells/image (too much variance for meaningful interpretation)
+
+# ── DYNAMIC SCHEMA DETECTION (failsafe) ──────────────────────────────────────
+# Harmonize the fast-loader output to the names the rest of this section expects,
+# and flag which optional channels are present. Minimum assumed: nuclei + nuclear
+# foci (the core readout). tdTomato, whole-cell (cytoplasmic) GFP, and cytoplasmic
+# foci are OPTIONAL: if a channel is missing the analysis skips it and never errors.
+combined_Df <- as.data.table(combined_Df)
+
+# Rename `from` -> `to` only when `from` exists and `to` does not. This bridges the
+# loader's output names to the legacy names used downstream (so older exports that
+# already use the legacy names pass through untouched).
+rename_if_present <- function(dt, from, to) {
+  if (from %in% names(dt) && !(to %in% names(dt))) setnames(dt, from, to)
+  invisible(dt)
+}
+rename_if_present(combined_Df, "NucFoci",                                 "Children_GFP_foci_Count")  # per-cell nuclear foci count
+rename_if_present(combined_Df, "Nuc_Area",                                "AreaShape_Area")           # nucleus area
+rename_if_present(combined_Df, "Nuc_FormFactor",                          "AreaShape_FormFactor")     # nucleus form factor
+rename_if_present(combined_Df, "Intensity_IntegratedIntensity_tdTomato",  "Intensity_IntegratedIntensity_P2A_tdTomato")
+rename_if_present(combined_Df, "AreaShape_Area_tdTomato",                  "AreaShape_Area_P2A_tdTomato")
+
+# Presence flags: column exists AND has at least one non-NA value.
+has_col <- function(dt, x) x %in% names(dt) && any(!is.na(dt[[x]]))
+has_td_int        <- has_col(combined_Df, "Intensity_IntegratedIntensity_P2A_tdTomato")
+has_td_area       <- has_col(combined_Df, "AreaShape_Area_P2A_tdTomato")
+has_cyto_gfp      <- has_col(combined_Df, "IntegratedIntensity_CytoplasmGFP")        # whole-cell GFP integrated intensity
+has_cyto_foci     <- has_col(combined_Df, "CytoFoci")                                # cytoplasmic foci count
+has_cyto_foci_int <- has_col(combined_Df, "Total_CytoFoci_IntegratedIntensity")
+has_nucfoci_area  <- has_col(combined_Df, "Avg_NucFoci_Area")
+has_nucfoci_compact    <- has_col(combined_Df, "Avg_NucFoci_Compactness")
+has_nucfoci_int   <- has_col(combined_Df, "Avg_NucFoci_IntegratedIntensity")
+
+# Hard requirement: nuclear-foci count is the core readout for everything below.
+if (!("Children_GFP_foci_Count" %in% names(combined_Df)))
+  stop("No nuclear-foci count column (NucFoci / Children_GFP_foci_Count) found -- this is the core readout.")
+
+message("Channels detected -> tdTomato(int): ", has_td_int,
+        " | whole-cell GFP: ", has_cyto_gfp,
+        " | cyto foci: ", has_cyto_foci,
+        " | nuc-foci morphology: ", has_nucfoci_area || has_nucfoci_compact || has_nucfoci_int)
+# ─────────────────────────────────────────────────────────────────────────────
+
 combined_Df <- combined_Df %>%
-  
+
   group_by(plate_Num, Well_Num, ImageNumber) %>%
   
   arrange(Children_GFP_foci_Count, .by_group = TRUE) %>%
@@ -538,10 +779,18 @@ combined_Df <- combined_Df %>%
     Nuclear_Area = mean(AreaShape_Area, na.rm = TRUE),
     FormFactor = mean(AreaShape_FormFactor, na.rm = TRUE),
     Avg_Foci      = mean(mean_Nuc_Foci, na.rm = TRUE),
-    
+
     tdTomato_Area = if (has_td_area) mean(AreaShape_Area_P2A_tdTomato, na.rm = TRUE) else NA_real_,
     tdTomato      = if (has_td_int)  mean(Intensity_IntegratedIntensity_P2A_tdTomato, na.rm = TRUE) else NA_real_,
-    
+
+    # NEW per-condition metrics (materialized as NA when the channel is absent so
+    # downstream select()/across()/diff calls never break) ----------------------
+    WholeCell_GFP_IntegratedIntensity = if (has_cyto_gfp)      mean(IntegratedIntensity_CytoplasmGFP,   na.rm = TRUE) else NA_real_,  # total cellular GFP integrated intensity / cell
+    CytoFoci_Count        = if (has_cyto_foci)     mean(CytoFoci,                           na.rm = TRUE) else NA_real_,  # cytoplasmic foci count / cell
+    NucFoci_Area          = if (has_nucfoci_area)  mean(Avg_NucFoci_Area,                   na.rm = TRUE) else NA_real_,  # nuclear-foci size
+    NucFoci_Compactness    = if (has_nucfoci_compact)    mean(Avg_NucFoci_Compactness,             na.rm = TRUE) else NA_real_,  # nuclear-foci compactness
+    NucFoci_IntegratedIntensity = if (has_nucfoci_int)   mean(Avg_NucFoci_IntegratedIntensity,    na.rm = TRUE) else NA_real_,  # nuclear-foci integrated intensity
+
     AssayType  = unique(SignalStatus),
     Condition  = unique(Condition),
     .groups = "drop"
@@ -652,9 +901,18 @@ combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")
     # Calculate normalized differences for nuclear area, form factor, and cell count
     NuclearAreaDiff = (Nuclear_Area - mean(Nuclear_Area)) / mean(Nuclear_Area) * 100,
     FormFactorDiff = (FormFactor - mean(FormFactor)) / mean(FormFactor) * 100,
-    tdTomato_Diff = (tdTomato - mean(tdTomato)) / mean(tdTomato) * 100,
-    CellCountDiff = (Nuclei_Number - mean(Nuclei_Number)) / mean(Nuclei_Number) * 100
+    tdTomato_Diff = if (has_td_int) (tdTomato - mean(tdTomato)) / mean(tdTomato) * 100 else NA_real_,
+    CellCountDiff = (Nuclei_Number - mean(Nuclei_Number)) / mean(Nuclei_Number) * 100,
+
+    # NEW: per-condition CHANGE (% vs plate mean) in nuclear-foci morphology
+    NucFoci_Area_Diff       = if (has_nucfoci_area) (NucFoci_Area       - mean(NucFoci_Area,       na.rm = TRUE)) / mean(NucFoci_Area,       na.rm = TRUE) * 100 else NA_real_,
+    NucFoci_Compactness_Diff = if (has_nucfoci_compact)   (NucFoci_Compactness - mean(NucFoci_Compactness, na.rm = TRUE)) / mean(NucFoci_Compactness, na.rm = TRUE) * 100 else NA_real_,
+    NucFoci_IntegratedIntensity_Diff = if (has_nucfoci_int)  (NucFoci_IntegratedIntensity - mean(NucFoci_IntegratedIntensity, na.rm = TRUE)) / mean(NucFoci_IntegratedIntensity, na.rm = TRUE) * 100 else NA_real_
     )
+
+# FAILSAFE: if tdTomato was absent, drop the all-NA diff column so the optional
+# tdTomato residual analysis below (gated on column presence) is cleanly skipped.
+if (!has_td_int) temp_stats_Df$tdTomato_Diff <- NULL
 
 #Remove any duplicated columns up till now 
 
@@ -684,166 +942,7 @@ temp_stats_Df[order(temp_stats_Df$PercentEffect, decreasing = TRUE),]
 colnames(temp_stats_Df)
 ```
 
-```{r}
-if ("tdTomato_Diff" %in% names(temp_stats_Df)) {
-  
-  
-  # --- Create output directory FIRST ---
-  out_dir <- paste0(save_Location, "residuals/")
-  dir.create(out_dir, showWarnings = FALSE)
-  
-  # --- Classify wells ---
-  tdTomato_Df <- temp_stats_Df %>%
-    ungroup() %>%
-    mutate(
-      tdTomato_outlier = abs(tdTomato_Diff) > 50,
-      hit_class = case_when(
-        tdTomato_outlier                               ~ "tdTomato outlier",
-        PercentEffect > 20 & tdTomato_Diff > -10      ~ "Confirmed hit",
-        PercentEffect > 20 & tdTomato_Diff <= -10     ~ "Suspect — co-suppressed",
-        PercentEffect <= 20 & tdTomato_Diff <= -10    ~ "tdTomato suppressed only",
-        TRUE                                           ~ "Inactive"
-      ),
-      hit_class = factor(hit_class, levels = c(
-        "Confirmed hit", "Suspect — co-suppressed",
-        "tdTomato suppressed only", "Inactive", "tdTomato outlier"
-      ))
-    )
-  
-  # --- Color palette ---
-  hit_colors <- c(
-    "Confirmed hit"            = "steelblue",
-    "Suspect — co-suppressed"  = "tomato",
-    "tdTomato suppressed only" = "goldenrod",
-    "Inactive"                 = "gray70",
-    "tdTomato outlier"         = "black"
-  )
-  
-  # --- P1: PercentEffect quadrant ---
-  y_max <- max(tdTomato_Df$PercentEffect, na.rm = TRUE)
-  y_min <- min(tdTomato_Df$PercentEffect, na.rm = TRUE)
-  
-  p1 <- ggplot(tdTomato_Df, aes(x = tdTomato_Diff, y = PercentEffect, color = hit_class)) +
-    geom_point(alpha = 0.6, size = 1.5) +
-    scale_color_manual(values = hit_colors) +
-    coord_cartesian(xlim = c(-50, 50), ylim = c(y_min, y_max)) +
-    geom_hline(yintercept = 20,  linetype = "dashed", color = "gray40") +
-    geom_vline(xintercept = -10, linetype = "dashed", color = "gray40") +
-    annotate("text", x = -49, y = y_max * 0.95,
-             label = "Suspect / co-suppressed", color = "tomato",    size = 3, hjust = 0) +
-    annotate("text", x = -5,  y = y_max * 0.95,
-             label = "Confirmed hits",          color = "steelblue", size = 3, hjust = 0) +
-    labs(
-      x     = "tdTomato % Diff (negative = non-specific suppression)",
-      y     = "MLF2-GFP % Effect (positive = fewer foci)",
-      color = "Hit class",
-      title = "Quadrant: PercentEffect vs. tdTomato"
-    ) +
-    theme_bw(base_size = 12) +
-    guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
-    theme(
-      legend.position = "bottom",
-      legend.text     = element_text(size = 9),
-      legend.key.size = unit(0.4, "cm")
-    )
-  
-  # --- Residual model ---
-  suspects <- tdTomato_Df %>%
-    filter(hit_class == "Suspect — co-suppressed") %>%
-    ungroup()
-  
-  suspect_model <- lm(PercentEffect ~ tdTomato_Diff, data = suspects)
-  model_summary <- summary(suspect_model)
-  
-  residual_threshold <- median(suspects$residual, na.rm = TRUE) + 
-                        1.5 * mad(suspects$residual,  na.rm = TRUE)
-  
-  # --- Mutate residuals BEFORE sink ---
-  suspects <- suspects %>%
-    mutate(
-      fitted        = fitted(suspect_model),
-      residual      = residuals(suspect_model),
-      residual_rank = rank(-residual),
-      residual_hit  = residual >= 20
-    )
-  
-  # --- Save model summary (now has residual info) ---
-  sink(file.path(out_dir, "suspect_model_summary.txt"))
-  cat("=== Suspect Cluster Regression Model ===\n\n")
-  cat("Formula: PercentEffect ~ tdTomato_Diff\n")
-  cat("Subset: hit_class == 'Suspect — co-suppressed'\n\n")
-  print(model_summary)
-  cat("\n=== Model Performance ===\n")
-  cat("R-squared:         ", round(model_summary$r.squared,     3), "\n")
-  cat("Adjusted R-squared:", round(model_summary$adj.r.squared, 3), "\n")
-  cat("Residual Std Error:", round(model_summary$sigma,         3), "\n")
-  cat("\n=== Residual Threshold ===\n")
-  cat("Method: residual >= 20\n")
-  cat("Rescued hits:", sum(suspects$residual_hit), "\n")
-  cat("Total suspects:", nrow(suspects), "\n")
-  sink()
-  
-  # --- P2: Residual rescue plot ---
-  p2 <- ggplot(suspects, aes(x = tdTomato_Diff, y = PercentEffect)) +
-    geom_segment(aes(xend = tdTomato_Diff, yend = fitted),
-                 color = "gray60", alpha = 0.4, linewidth = 0.4) +
-    geom_point(aes(color = residual_hit), size = 2.5, alpha = 0.8) +
-    geom_smooth(method = "lm", color = "gray30", se = TRUE, linetype = "dashed") +
-    scale_color_manual(values = c("FALSE" = "tomato", "TRUE" = "steelblue"),
-                       labels = c("FALSE" = "Suspect", "TRUE" = "Residual-rescued")) +
-    labs(
-      x        = "tdTomato % Diff",
-      y        = "MLF2-GFP % Effect",
-      color    = NULL,
-      title    = "Residual rescue within suspect cluster",
-      subtitle = paste0("R² = ",    round(model_summary$r.squared, 2),
-                        "  |  Adj R² = ", round(model_summary$adj.r.squared, 2),
-                        "  |  slope = ", round(coef(suspect_model)[2], 2),
-                        "  |  n = ",    nrow(suspects))
-    ) +
-    theme_bw(base_size = 12) +
-    theme(legend.position = "bottom")
-  
-  # --- Combined layout ---
-  combined <- p1 / p2
-  print(combined)
-  
-  # --- Save figures ---
-  ggsave(file.path(out_dir, "p1_percenteffect_quadrant.png"), p1,       width = 10, height = 7,  dpi = 300)
-  ggsave(file.path(out_dir, "p2_residual_rescue.png"),        p2,       width = 10, height = 7,  dpi = 300)
-  ggsave(file.path(out_dir, "residual_plots.png"),            combined, width = 10, height = 14, dpi = 300)
-  
-  # --- Join residuals back to main df ---
-  cols_to_remove <- c("tdTomato_outlier", "hit_class", "fitted", 
-                      "residual_hit", "residual_rank", "GFP_residual", "hit_candidate")
-  
-  suspects2 <- suspects[suspects$residual >= 20, 
-                        !names(suspects) %in% cols_to_remove]
-  
-  temp_stats_Df <- temp_stats_Df %>%
-    left_join(suspects2 %>% select(plate_Num, Well_Num, residual),
-              by = c("plate_Num", "Well_Num"))
-  
-  # --- Save Excel ---
-  wb <- createWorkbook()
-  addWorksheet(wb, "All Wells")
-  writeData(wb, "All Wells", tdTomato_Df)
-  addWorksheet(wb, "Confirmed Hits")
-  writeData(wb, "Confirmed Hits", tdTomato_Df %>% 
-              filter(hit_class == "Confirmed hit") %>% 
-              arrange(desc(PercentEffect)))
-  addWorksheet(wb, "Residual Rescued")
-  writeData(wb, "Residual Rescued", suspects %>% 
-              filter(residual_hit) %>% 
-              arrange(desc(residual)))
-  addWorksheet(wb, "Suspects")
-  writeData(wb, "Suspects", suspects %>% arrange(desc(residual)))
-  saveWorkbook(wb, file.path(out_dir, "residual_analysis.xlsx"), overwrite = TRUE)
-  
-  cat("Residual analysis complete. Outputs saved to:", out_dir, "\n")
-}
-
-```
+<!-- tdTomato quadrant + residual-rescue analysis relocated to the NORMALIZED SCORE PLOT section below. -->
 
 ```{r}
 # B-SCORE CALCULATION (CONTROLS FOR POSITIONAL EFFECTS) 
@@ -1122,10 +1221,19 @@ base_on  <- c("ZScore", "Viability", "plate_Num", "Well_Num", "ZPrime_Score",
 td_cols <- character(0)
 if (has_td_area) td_cols <- c(td_cols, "tdTomato_Area")
 if (has_td_int)  td_cols <- c(td_cols, "tdTomato", "tdTomato_Diff")
-if ("residual" %in% names(temp_stats_Df)) td_cols <- c(td_cols, "residual")  
+if ("residual" %in% names(temp_stats_Df)) td_cols <- c(td_cols, "residual")
+
+# NEW optional readouts to carry into the Combined Analysis export. They are kept
+# only if present (intersect with names below) and dropped later if entirely NA:
+#   whole-cell GFP integrated intensity, cytoplasmic foci count + total integrated
+#   intensity, and nuclear-foci size / compactness / integrated intensity (+ % change).
+new_metric_cols <- c("WholeCell_GFP_IntegratedIntensity",
+                     "NucFoci_Area", "NucFoci_Compactness", "NucFoci_IntegratedIntensity",
+                     "NucFoci_Area_Diff", "NucFoci_Compactness_Diff", "NucFoci_IntegratedIntensity_Diff",
+                     "CytoFoci_Count")
 
 if (assayType == "OFF") {
-  keep_cols <- intersect(c(base_off, td_cols), names(combined_Df_out))
+  keep_cols <- intersect(c(base_off, td_cols, new_metric_cols), names(combined_Df_out))
 
   combined_Df_out <- combined_Df_out %>%
     select(all_of(keep_cols)) %>%
@@ -1142,7 +1250,7 @@ if (assayType == "OFF") {
     mutate(across(where(is.numeric), ~ round(.x, 2)))
 
 } else {
-  keep_cols <- intersect(c(base_on, td_cols), names(combined_Df_out))
+  keep_cols <- intersect(c(base_on, td_cols, new_metric_cols), names(combined_Df_out))
 
   combined_Df_out <- combined_Df_out %>%
     select(all_of(keep_cols)) %>%
@@ -1184,7 +1292,7 @@ td_cols_all <- c(
   "Pos_TdTomatoIntensity", "Neg_TdTomatoIntensity", "residual"
 )
 
-combined_Df_out <- drop_all_na_cols(combined_Df_out, td_cols_all)
+combined_Df_out <- drop_all_na_cols(combined_Df_out, c(td_cols_all, new_metric_cols))
 ctrls           <- drop_all_na_cols(ctrls, td_cols_all)
 plate_Summary   <- drop_all_na_cols(plate_Summary, td_cols_all)
 
@@ -1223,31 +1331,31 @@ options(scipen = 999)
 # ============================================================================
 # CONDENSCREEN FIGURE GENERATION 
 # ============================================================================
-
+ 
 # ------------- DATA LOADING AND PREPARATION -------------
 # Load workbook from predefined location (assuming save_Location is defined elsewhere)
-export_File <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx"
-
+file_Location <- "/home/userX/pathsource/"
+export_File <- paste0(file_Location, "CondenScreenV2_temp.xlsx" )  
+save_Location <- file_Location
+ image_Save_Location <- save_Location
 wb <- loadWorkbook(export_File)
-
-
+ 
+ 
 merged_df <- read.xlsx(wb, sheet = "Combined Analysis")
-
+ 
 # Convert numeric columns to proper type
-merged_df$Average_foci_perCell <- as.numeric(merged_df$AvgFoci)
-merged_df$Normalized_Effect <- as.numeric(merged_df$PercentEffect)
-merged_df <- merged_df[!as.character(merged_df$Plate) %in% c("45", "46", "47"), ]
+#merged_df <- merged_df[!as.character(merged_df$Plate) %in% c("45", "46", "47"), ]
 #EDIT: Change to location of a file linking compound/gene names to each well, if applicable, else comment out, and run the following 
 #############################################################
 template_location <- file.path(file_Location, "plateMap.xlsx")
 template_exists <- file.exists(template_location)
-
+ 
 # Define candidates outside the if/else so both branches can access them
 well_candidates   <- c("Well", "Well_Condition")
 ref_candidates    <- c("Reference", "Gene", "Compound")
 cas_candidates    <- c("CAS", "CAS.Number")
 smiles_candidates <- c("SMILES")
-
+ 
 if (template_exists) {
   template <- read.xlsx(template_location)
   
@@ -1296,53 +1404,444 @@ if (template_exists) {
 sheet_hits = "Hits"
 sheet_df = "Combined Analysis"
 merged_df <- merged_df[!is.na(merged_df$Reference), ]  # Keep only rows with reference names (compounds, genes, etc.)
-
+ 
 # 1) Build hits_df2 (hits + QC columns)
 hits_df <- if (assayType == "OFF") {
   merged_df %>% filter(BZScore >= 3)
 } else {
   merged_df %>% filter(ZScore >= 3)
 }
-
+ 
 # (optional) make factors safe for Excel
 hits_df <- hits_df %>% mutate(across(where(is.factor), as.character))
 merged_df2 <- merged_df %>% mutate(across(where(is.factor), as.character))
-
+ 
 # 2) Load the existing workbook and overwrite both sheets
 wb <- loadWorkbook(export_File)
-
+ 
 if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
 addWorksheet(wb, sheet_hits)
 #Order by BZ-Score (descending)
 hits_df <- hits_df %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
-
+ 
 writeData(wb, sheet_hits, hits_df, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_hits, firstActiveRow = 2)
 addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(hits_df))
-
+ 
 if (sheet_df %in% names(wb)) removeWorksheet(wb, sheet_df)
 addWorksheet(wb, sheet_df)
-
+ 
 #Order by BZ-Score (descending)
 merged_df2 <- merged_df2 %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
 writeData(wb, sheet_df, merged_df2, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_df, firstActiveRow = 2)
 addFilter(wb, sheet_df, rows = 1, cols = 1:ncol(merged_df2))
-
+ 
 saveWorkbook(wb, export_File, overwrite = TRUE)
 ```
-
+ 
 ```{r}
-#NORMALIZED SCORE PLOT:
+ #NORMALIZED SCORE PLOT:
+ 
+# == tdTomato QUADRANT + RESIDUAL RESCUE (relocated here from mid-pipeline) =====
+# Runs only when tdTomato data exist. Operates on the final reloaded `merged_df`
+# (which carries PercentEffect, tdTomato_Diff, Plate, Well), saves the quadrant
+# and residual-rescue figures next to the normalized-score plot, and adds:
+#   - `residual`        : numeric, non-NA only for residual-rescued wells
+#   - `residual_rescue` : TRUE/FALSE flag written to the Excel sheet
+ 
+# Fallback for restarted sessions where `merged_df` was reloaded directly from
+# CondenScreenV2.xlsx and the earlier `has_td_int <- has_col(...)` step never ran.
+# Treat tdTomato as present if `tdTomato_Diff` exists in merged_df AND is actually
+# populated (not all-NA, which is how the earlier pipeline marks "no tdTomato channel").
+if (!exists("has_td_int")) {
+  has_td_int <- "tdTomato_Diff" %in% names(merged_df) &&
+    any(!is.na(merged_df$tdTomato_Diff))
+}
+ 
+if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
+ 
+  out_dir <- paste0(save_Location, "residuals/")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+ 
+  # drop any stale residual columns so the joins below stay clean
+  merged_df <- merged_df %>% dplyr::select(-dplyr::any_of(c("residual", "residual_rescue")))
+ 
+  # --- Classify wells ---
+  # TotalPercentTdTomato: tdTomato signal expressed as % of the plate mean
+  # (tdTomato_Diff is already the % difference from the plate mean, so 100 + diff).
+  #
+  # Hit-class boundary is driven by Z/BZ-score > 3 (not PercentEffect). A well
+  # can be PercentEffect >= 40 and still be gray/red/yellow if its Z/BZ-score
+  # doesn't clear 3 -- PercentEffect is shown on the y-axis but no longer used
+  # for the color classification.
+  score_col_hc <- if ("BZScore" %in% names(merged_df) && any(!is.na(merged_df$BZScore))) "BZScore" else "ZScore"
+ 
+  tdTomato_Df <- merged_df %>%
+    mutate(
+      TotalPercentTdTomato = 100 + tdTomato_Diff,
+      tdTomato_outlier = TotalPercentTdTomato > 150,
+      score_value_hc = .data[[score_col_hc]],
+ 
+      hit_class = case_when(
+        # Viability is a % difference from the plate mean (centered at 0), so
+        # "<= 50% viable" corresponds to a drop of more than 50 percentage
+        # points relative to the plate mean, i.e. Viability < -50.
+        Viability < -50 ~ "Low viability / toxic",
+ 
+        tdTomato_outlier ~ "tdTomato outlier",
+ 
+        score_value_hc > 3 & Viability >= -50 & TotalPercentTdTomato >= 75 ~
+          "Confirmed hit",
+ 
+        score_value_hc > 3 & Viability >= -50 & TotalPercentTdTomato < 75 ~
+          "Suspect — co-suppressed",
+ 
+        score_value_hc <= 3 & TotalPercentTdTomato < 75 ~
+          "tdTomato suppressed only",
+ 
+        TRUE ~ "Inactive"
+      ),
+ 
+      hit_class = factor(
+        hit_class,
+        levels = c(
+          "Confirmed hit",
+          "Low viability / toxic",
+          "Suspect — co-suppressed",
+          "tdTomato suppressed only",
+          "Inactive",
+          "tdTomato outlier"
+        )
+      )
+    )
+ 
+  # --- Colors ---
+  hit_colors <- c(
+    "Confirmed hit"            = "steelblue",
+    "Low viability / toxic"    = "black",
+    "Suspect — co-suppressed"  = "tomato",
+    "tdTomato suppressed only" = "goldenrod",
+    "Inactive"                 = "gray70",
+    "tdTomato outlier"         = "darkgreen"
+  )
+ 
+  # --- Plot limits ---
+  y_max <- max(tdTomato_Df$PercentEffect, na.rm = TRUE)
+  y_min <- min(tdTomato_Df$PercentEffect, na.rm = TRUE)
+  x_min <- min(tdTomato_Df$TotalPercentTdTomato, na.rm = TRUE)
+  x_max <- max(tdTomato_Df$TotalPercentTdTomato, na.rm = TRUE)
+ 
+  # --- Suspect wells for residual model ---
+  suspects <- tdTomato_Df %>% filter(hit_class == "Suspect — co-suppressed")
+ 
+  if (nrow(suspects) >= 3) {
+ 
+    # --- Residual model ---
+    suspect_model <- lm(PercentEffect ~ TotalPercentTdTomato, data = suspects)
+    model_summary <- summary(suspect_model)
+ 
+    suspects <- suspects %>%
+      mutate(
+        fitted        = fitted(suspect_model),
+        residual      = residuals(suspect_model),
+        residual_rank = rank(-residual),
+        residual_hit  = residual >= 20 & Viability >= -50
+      )
+ 
+    # --- Save model summary ---
+    sink(file.path(out_dir, "suspect_model_summary.txt"))
+    cat("=== Suspect Cluster Regression Model ===\n\n")
+    cat("Formula: PercentEffect ~ TotalPercentTdTomato\n")
+    cat("Subset: hit_class == 'Suspect — co-suppressed'\n\n")
+    print(model_summary)
+    cat("\n=== Model Performance ===\n")
+    cat("R-squared:         ", round(model_summary$r.squared,     3), "\n")
+    cat("Adjusted R-squared:", round(model_summary$adj.r.squared, 3), "\n")
+    cat("Residual Std Error:", round(model_summary$sigma,         3), "\n")
+    cat("\n=== Residual Rescue Rule ===\n")
+    cat("Method: residual >= 20 AND Viability >= -50\n")
+    cat("Rescued hits:", sum(suspects$residual_hit), "\n")
+    cat("Total suspects:", nrow(suspects), "\n")
+    sink()
+ 
+    # --- Add residual-rescued flag back onto main plotting df ---
+    rescued_ids <- suspects %>%
+      filter(residual_hit) %>%
+      select(Plate, Well)
+ 
+    tdTomato_Df <- tdTomato_Df %>%
+      left_join(
+        rescued_ids %>% mutate(residual_rescued = TRUE),
+        by = c("Plate", "Well")
+      ) %>%
+      mutate(residual_rescued = ifelse(is.na(residual_rescued), FALSE, residual_rescued))
+ 
+  } else {
+ 
+    suspects <- suspects %>%
+      mutate(
+        fitted        = NA_real_,
+        residual      = NA_real_,
+        residual_rank = NA_real_,
+        residual_hit  = FALSE
+      )
+ 
+    tdTomato_Df <- tdTomato_Df %>% mutate(residual_rescued = FALSE)
+ 
+    message("Too few suspects (", nrow(suspects), ") for residual model -- skipping residual rescue.")
+  }
+ 
+  # --- hit_class_final: folds in residual-rescue + low-viability override ---
+  # (computed once, regardless of which branch above ran, so p1 only needs
+  # to be built a single time below)
+  tdTomato_Df <- tdTomato_Df %>%
+    mutate(
+      hit_class_final = case_when(
+        Viability < -50 ~ "Low viability / toxic",
+        residual_rescued & Viability >= -50 ~ "Residual-rescued",
+        TRUE ~ as.character(hit_class)
+      ),
+      hit_class_final = factor(
+        hit_class_final,
+        levels = c(
+          "Confirmed hit",
+          "Residual-rescued",
+          "Low viability / toxic",
+          "Suspect — co-suppressed",
+          "tdTomato suppressed only",
+          "Inactive",
+          "tdTomato outlier"
+        )
+      )
+    )
+ 
+  hit_colors_final <- c(
+    "Confirmed hit"            = "steelblue",
+    "Residual-rescued"         = "steelblue",
+    "Low viability / toxic"    = "black",
+    "Suspect — co-suppressed"  = "tomato",
+    "tdTomato suppressed only" = "goldenrod",
+    "Inactive"                 = "gray70",
+    "tdTomato outlier"         = "darkgreen"
+  )
+ 
+  # --- P1: quadrant plot (built once; viable residual-rescued labeled in blue) ---
+  p1 <- ggplot(
+    tdTomato_Df,
+    aes(x = TotalPercentTdTomato, y = PercentEffect, color = hit_class_final)
+  ) +
+    # --- Points, layered so gray "Inactive" wells fade into the background ---
+    # --- and the blue confirmed/rescued hits stand out clearly.            ---
+    geom_point(
+      data = tdTomato_Df %>% filter(hit_class_final == "Inactive"),
+      alpha = 0.25, size = 0.8
+    ) +
+    geom_point(
+      data = tdTomato_Df %>% filter(!hit_class_final %in% c("Inactive", "Confirmed hit", "Residual-rescued")),
+      alpha = 0.6, size = 1.5
+    ) +
+    geom_point(
+      data = tdTomato_Df %>% filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")),
+      alpha = 0.9, size = 2.2
+    ) +
+    geom_text_repel(
+      data = tdTomato_Df %>%
+        filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued"), PercentEffect > 33.3),
+      aes(label = Reference),
+      size = 3,
+      max.overlaps = Inf,
+      box.padding = 0.3,
+      point.padding = 0.2,
+      show.legend = FALSE
+    ) +
+    # Also label any well with a strong effect (>75%) that isn't tdTomato-suppressed
+    # (red "Suspect" or yellow "tdTomato suppressed only"), even if it didn't clear
+    # the tdTomato/viability bars for "Confirmed hit"
+    geom_text_repel(
+      
+      data = tdTomato_Df %>%
+        filter(PercentEffect > 75,
+           !hit_class_final %in% c("Suspect — co-suppressed", "tdTomato suppressed only", "Low viability / toxic")),
+      
+       
+      aes(label = Reference),
+      size = 3,
+      max.overlaps = Inf,
+      box.padding = 0.3,
+      point.padding = 0.2,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = hit_colors_final) +
+    coord_cartesian(
+      xlim = c(max(0, x_min), min(150, x_max)),
+      ylim = c(y_min, y_max)
+    ) +
+    geom_vline(xintercept = 75, linetype = "dashed", color = "gray40") +
+    geom_hline(yintercept = 33.3, linetype = "dashed", color = "gray40") +
+    annotate(
+      "text", x = 76, y = y_max * 0.95,
+      label = "Confirmed / residual-rescued", color = "steelblue", size = 3, hjust = 0
+    ) +
+    annotate(
+      "text", x = max(1, x_min), y = y_max * 0.95,
+      label = "Suspect / co-suppressed", color = "tomato", size = 3, hjust = 0
+    ) +
+    labs(
+      x = "tdTomato % of plate mean",
+      y = "MLF2-GFP % Effect",
+      color = "Hit class",
+      title = "Quadrant: PercentEffect vs. tdTomato",
+      subtitle = paste0(
+        "Blue = viable confirmed/residual-rescued hits (", score_col_hc, " > 3, tdTomato >= 75% or residual-rescued, Viability >= -50); ",
+        "black = Viability < -50. PercentEffect (y-axis) does not affect color."
+      )
+    ) +
+    theme_bw(base_size = 12) +
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+    theme(
+      legend.position = "bottom",
+      legend.text = element_text(size = 9),
+      legend.key.size = unit(0.4, "cm")
+    )
+ 
+  if (nrow(suspects) >= 3) {
+ 
+    # --- P2: residual rescue plot ---
+    p2 <- ggplot(suspects, aes(x = TotalPercentTdTomato, y = PercentEffect)) +
+      geom_segment(
+        aes(xend = TotalPercentTdTomato, yend = fitted),
+        color = "gray60", alpha = 0.4, linewidth = 0.4
+      ) +
+      geom_point(aes(color = residual_hit), size = 2.5, alpha = 0.8) +
+      geom_text_repel(
+        data = suspects %>% filter(residual_hit),
+        aes(label = Reference),
+        size = 3,
+        max.overlaps = Inf,
+        box.padding = 0.3,
+        point.padding = 0.25,
+        show.legend = FALSE
+      ) +
+      geom_smooth(method = "lm", color = "gray30", se = TRUE, linetype = "dashed") +
+      scale_color_manual(values = c("FALSE" = "tomato", "TRUE" = "steelblue"),
+                         labels = c("FALSE" = "Suspect", "TRUE" = "Residual-rescued")) +
+      labs(
+        x        = "tdTomato % of plate mean",
+        y        = "MLF2-GFP % Effect",
+        color    = NULL,
+        title    = "Residual rescue within viable suspect cluster",
+        subtitle = paste0("R² = ",    round(model_summary$r.squared, 2),
+                          "  |  Adj R² = ", round(model_summary$adj.r.squared, 2),
+                          "  |  slope = ", round(coef(suspect_model)[2], 2),
+                          "  |  n = ",    nrow(suspects),
+                          "  |  rescue rule: residual >= 20 and Viability >= -50")
+      ) +
+      theme_bw(base_size = 12) +
+      theme(legend.position = "bottom")
+ 
+    combined <- p1 / p2
+    # print() can occasionally exceed the RStudio Plots pane's minimum size and
+    # throw "Plots window too small"; that's a display-only issue, the figures
+    # are still written to disk below, so don't let it abort the chunk.
+    tryCatch(print(combined), error = function(e) {
+      message("Skipping inline preview of combined plot (display area too small): ", conditionMessage(e))
+    })
+ 
+    ggsave(file.path(out_dir, "p1_percenteffect_quadrant.png"), p1, width = 10, height = 7, dpi = 300)
+    ggsave(file.path(out_dir, "p2_residual_rescue.png"), p2,       width = 10, height = 7,  dpi = 300)
+    ggsave(file.path(out_dir, "residual_plots.png"),     combined, width = 10, height = 14, dpi = 300)
+    ggsave(paste0(image_Save_Location, "tdTomato_quadrant.pdf"), p1, width = 10, height = 7, dpi = 300)
+    ggsave(paste0(image_Save_Location, "tdTomato_residual_rescue.pdf"), p2, width = 10, height = 7, dpi = 300)
+ 
+    # --- bring `residual` back onto merged_df for viable RESCUED wells only ---
+    merged_df <- merged_df %>%
+      left_join(suspects %>% filter(residual_hit) %>% select(Plate, Well, residual),
+                by = c("Plate", "Well"))
+ 
+  } else {
+ 
+    tryCatch(print(p1), error = function(e) {
+      message("Skipping inline preview of p1 (display area too small): ", conditionMessage(e))
+    })
+ 
+    ggsave(file.path(out_dir, "p1_percenteffect_quadrant.png"), p1, width = 10, height = 7, dpi = 300)
+    ggsave(paste0(image_Save_Location, "tdTomato_quadrant.pdf"), p1, width = 10, height = 7, dpi = 300)
+ 
+    merged_df$residual <- NA_real_
+  }
+ 
+  # residual_rescue flag for the Excel sheet (TRUE only for viable residual-rescued wells)
+  merged_df <- merged_df %>% mutate(residual_rescue = !is.na(residual))
+ 
+  # --- Aux workbook ---
+  wb_res <- createWorkbook()
+ 
+  addWorksheet(wb_res, "All Wells")
+  writeData(wb_res, "All Wells", tdTomato_Df %>% arrange(desc(PercentEffect)))
+ 
+  addWorksheet(wb_res, "Confirmed Hits")
+  writeData(wb_res, "Confirmed Hits",
+            tdTomato_Df %>%
+              filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")) %>%
+              filter(Viability >= -50) %>%
+              arrange(desc(PercentEffect)))
+ 
+  addWorksheet(wb_res, "Residual Rescued")
+  writeData(wb_res, "Residual Rescued",
+            suspects %>% filter(residual_hit, Viability >= -50) %>% arrange(desc(residual)))
+ 
+  addWorksheet(wb_res, "Suspects")
+  writeData(wb_res, "Suspects", suspects %>% arrange(desc(residual)))
+ 
+  addWorksheet(wb_res, "Export Hits")
+  writeData(wb_res, "Export Hits",
+            tdTomato_Df %>%
+              filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")) %>%
+              filter(Viability >= -50) %>%
+              arrange(desc(PercentEffect)))
+ 
+  addWorksheet(wb_res, "Low Viability Toxic")
+  writeData(wb_res, "Low Viability Toxic",
+            tdTomato_Df %>% filter(Viability < -50) %>% arrange(desc(PercentEffect)))
+ 
+  saveWorkbook(wb_res, file.path(out_dir, "residual_analysis.xlsx"), overwrite = TRUE)
+ 
+  cat("tdTomato quadrant/residual analysis complete. Aux outputs in:", out_dir, "\n")
+ 
+  # --- Re-write Combined Analysis + Hits with residual + residual_rescue ---
+  if (exists("export_File") && file.exists(export_File)) {
+    wb_x <- loadWorkbook(export_File)
+    md_x <- merged_df %>%
+      mutate(across(where(is.factor), as.character)) %>%
+      arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
+    hd_x <- if (assayType == "OFF") filter(md_x, BZScore >= 3) else filter(md_x, ZScore >= 3)
+    for (s in c("Combined Analysis", "Hits")) if (s %in% names(wb_x)) removeWorksheet(wb_x, s)
+    addWorksheet(wb_x, "Combined Analysis"); writeData(wb_x, "Combined Analysis", md_x)
+    freezePane(wb_x, "Combined Analysis", firstActiveRow = 2)
+    addFilter(wb_x, "Combined Analysis", rows = 1, cols = 1:ncol(md_x))
+    addWorksheet(wb_x, "Hits"); writeData(wb_x, "Hits", hd_x)
+    freezePane(wb_x, "Hits", firstActiveRow = 2)
+    addFilter(wb_x, "Hits", rows = 1, cols = 1:ncol(hd_x))
+    saveWorkbook(wb_x, export_File, overwrite = TRUE)
+  }
+}
+ 
 score_col <- if ("BZScore" %in% names(merged_df)) "BZScore" else "ZScore"
-
+ 
 merged_df <- merged_df %>%
   mutate(
     score_value = .data[[score_col]],
     bz_hit  = score_value >= 3,
     td_ok   = if (has_td_int && "tdTomato_Diff" %in% names(.)) {
-                # passes if tdTomato drop is acceptable OR was flagged by residual method
-                (tdTomato_Diff >= -25) | (!is.na(residual))
+                # passes if tdTomato drop is acceptable OR was flagged by residual method.
+                # `residual` only exists when the residual-rescue step produced hits, so
+                # guard on its presence (otherwise it's all-NA and gets dropped on export).
+                if ("residual" %in% names(.)) {
+                  (tdTomato_Diff >= -25) | (!is.na(residual))
+                } else {
+                  tdTomato_Diff >= -25
+                }
               } else {
                 TRUE  # no tdTomato data or not applicable — don't penalize
               },
@@ -1351,28 +1850,47 @@ merged_df <- merged_df %>%
               else TRUE
   ) %>%
   select(-score_value)
-
-
-plot_normalized_score <- function(df, assay_type, image_path, has_td_int = TRUE) {
-  score_col <- if (assay_type == "OFF") sym("BZScore") else sym("ZScore")
+ 
+# --- Export Hits sheet: BZ/Z >= 3 AND passes viability AND (tdTomato OK or residual-rescued) ---
+if (exists("export_File") && file.exists(export_File)) {
+  export_hits_df <- merged_df %>%
+    filter(bz_hit, viab_ok, td_ok) %>%
+    mutate(across(where(is.factor), as.character)) %>%
+    arrange(desc(.data[[score_col]]))
+ 
+  wb_eh <- loadWorkbook(export_File)
+  if ("Export Hits" %in% names(wb_eh)) removeWorksheet(wb_eh, "Export Hits")
+  addWorksheet(wb_eh, "Export Hits")
+  writeData(wb_eh, "Export Hits", export_hits_df, startCol = 1, startRow = 1, colNames = TRUE)
+  freezePane(wb_eh, "Export Hits", firstActiveRow = 2)
+  addFilter(wb_eh, "Export Hits", rows = 1, cols = 1:ncol(export_hits_df))
+  saveWorkbook(wb_eh, export_File, overwrite = TRUE)
+ 
+  cat("Export Hits sheet written:", nrow(export_hits_df), "hits passing BZ/Z >= 3, viability, and tdTomato/residual-rescue criteria\n")
+}
+ 
+ plot_normalized_score <- function(df, assay_type, image_path, has_td_int = TRUE) {
+  score_col <- if (assay_type == "OFF") "BZScore" else "ZScore"   # keep as string; symbol can't index df[[ ]]
   label_y   <- if (assay_type == "OFF") "BZ-Score" else "Z-Score"
-  y_limits  <- c(min(merged_df[[score_col]]), max(merged_df[[score_col]]))
+  y_limits  <- c(min(merged_df[[score_col]], na.rm = TRUE), max(merged_df[[score_col]], na.rm = TRUE))
   y_breaks  <- c(-4, -2, 0, 2, 4, 6, 8)
-
-  hits_df <- dplyr::filter(df, !!score_col >= 3)
-  bg_df   <- dplyr::filter(df, !!score_col < 3)
-
+ 
+  hits_df <- dplyr::filter(df, .data[[score_col]] >= 3)
+  bg_df   <- dplyr::filter(df, .data[[score_col]] < 3)
+ 
   if (has_td_int) {
     hits_df <- hits_df %>% mutate(pass = as.character(td_ok & viab_ok))
   } else {
-    hits_df <- hits_df %>% mutate(pass = "TRUE")
+    # No tdTomato channel: td_ok defaults to TRUE (set above), but viability
+    # still matters, so a hit only passes if it clears the viability bar.
+    hits_df <- hits_df %>% mutate(pass = as.character(viab_ok))
   }
-
-  p <- ggplot(df, aes(x = paste0(Well, Plate), y = !!score_col)) +
+ 
+  p <- ggplot(df, aes(x = paste0(Well, Plate), y = .data[[score_col]])) +
     geom_point(
       data     = bg_df,
-      color    = "black",
-      size     = 0.75,
+      color    = "gray70",
+      size     = 0.5,
       alpha    = 0.3,
       position = position_jitter(width = 0.3, height = 0)
     ) +
@@ -1381,8 +1899,10 @@ plot_normalized_score <- function(df, assay_type, image_path, has_td_int = TRUE)
       aes(color = pass, size = pass),
       alpha = 1
     ) +
-    scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
-    scale_size_manual(values  = c("TRUE" = 2.6,   "FALSE" = 2)) +
+    # Only label the strongest red hits (BZ/Z > 4) to avoid an unreadable wall of text
+    
+    scale_color_manual(values = c("TRUE" = "black", "FALSE" = "black")) +
+    scale_size_manual(values  = c("TRUE" = 1.6,   "FALSE" = 1.2)) +
     geom_hline(yintercept = 2, linetype = "dashed", linewidth = 1.5) +
    
     scale_y_continuous(limits = y_limits, breaks = y_breaks) +
@@ -1397,7 +1917,7 @@ plot_normalized_score <- function(df, assay_type, image_path, has_td_int = TRUE)
     ) +
     labs(x = "Compound", y = label_y) +
     guides(color = "none", size = "none")
-
+ 
   ggsave(
     filename = paste0(image_path, "normalized_SigScoreTdTomatoScreen.pdf"),
     plot     = p,
@@ -1405,17 +1925,16 @@ plot_normalized_score <- function(df, assay_type, image_path, has_td_int = TRUE)
     width    = 8,
     height   = 8
   )
-
+ 
   return(p)
 }
-
-plot_normalized_score(merged_df, assayType, image_Save_Location, has_td_int = has_td_int)
-
-image_Save_Location = file_Location
+plot_normalized_score(merged_df, assayType, image_Save_Location, has_td_int = has_td_int) 
+ 
+ 
+merged_df
 ```
-
-
-
+ 
+ 
 ```{r}
 #DISTRIBUTION PLOTS
 #------------------------------------------------------------------------------
@@ -1434,14 +1953,16 @@ image_Save_Location = file_Location
           axis.ticks.length = unit(0.4, "cm"),
           axis.ticks = element_line(size = 1.2))
   
-
-ggsave(paste(image_Save_Location, "TdTomatoScreenrawdistrpilot.pdf", sep = ""), 
-        raw_distribution, 
-        dpi = 300, 
-        width = 10, 
+ 
+ggsave(paste(image_Save_Location, "RawFociDistribution.pdf", sep = ""),
+        raw_distribution,
+        dpi = 300,
+        width = 10,
         height = 10)
-  
-
+ 
+print(raw_distribution)
+ 
+ 
 #NORMALIZED EFFECT DISTRIBUTION
   normalized_dist <- ggplot(merged_df, aes(x = PercentEffect)) +
     geom_histogram(color = "black", fill = "darkgray", binwidth = 4 ) +
@@ -1450,61 +1971,135 @@ ggsave(paste(image_Save_Location, "TdTomatoScreenrawdistrpilot.pdf", sep = ""),
     geom_vline(aes(xintercept = 100), linetype = 'dashed', size = 2.5) +
     geom_vline(aes(xintercept = 0), linetype = 'dashed', size = 2.5) +
     theme_classic() +
+    # Allow the rotated control-name labels (e.g. "DMSO") to draw past the
+    # panel edge instead of being clipped to "MSO"/etc.
+    coord_cartesian(clip = "off") +
     theme(title = element_text(size = 40, face = "bold"),
           axis.title.x = element_text(size = 36, face = "bold"),
           axis.text.y = element_text(size = 30, face = "bold"),
           axis.text.x = element_text(size = 30, face = "bold"),
           axis.ticks.length = unit(0.4, "cm"),
-          axis.ticks = element_line(size = 1.2))
-  
-  
+          axis.ticks = element_line(size = 1.2),
+          plot.margin = margin(t = 10, r = 10, b = 10, l = 30))
+ 
+ 
 #Normalized Distribution Plot:
+# Place the WT/DMSO control labels at half the tallest bin's height so they
+# sit roughly mid-plot regardless of how many wells/bins this run has.
+.hist_max <- max(
+  hist(merged_df$PercentEffect, breaks = seq(min(merged_df$PercentEffect, na.rm = TRUE),
+                                              max(merged_df$PercentEffect, na.rm = TRUE) + 4,
+                                              by = 4),
+       plot = FALSE)$counts
+)
+.label_y <- .hist_max / 2
+ 
 if (assayType == "OFF") {
 normalized_dist <- normalized_dist +
-  annotate("text", x = 90, y = 110, label = pos_Ctrl, angle = 90, size = 16) +
-  annotate("text", x = -15, y = 110, label = neg_Ctrl, color = "black", angle = 90, size = 16) +
+  annotate("text", x = 90, y = .label_y, label = pos_Ctrl, angle = 90, size = 16) +
+  annotate("text", x = -15, y = .label_y, label = neg_Ctrl, color = "black", angle = 90, size = 16) +
   labs(title = NULL, y = "Count", x = "% Decrease in Foci")
  } else {
 normalized_dist <- normalized_dist +
-  annotate("text", x = 90, y = 1300, label = pos_Ctrl, angle = 90, size = 14) +
-  annotate("text", x = -20, y = 1300, label = neg_Ctrl, color = "black", angle = 90, size = 14) +
+  annotate("text", x = 90, y = .label_y, label = pos_Ctrl, angle = 90, size = 14) +
+  annotate("text", x = -20, y = .label_y, label = neg_Ctrl, color = "black", angle = 90, size = 14) +
   labs(title = NULL, y = "Count", x = "% Increase in Foci")
  } 
      
   # Save distribution plots
-  ggsave(paste(image_Save_Location, "TdTomatoScreendistrpilot.pdf", sep = ""), 
-        normalized_dist, 
-        dpi = 300, 
-        width = 10, 
+  ggsave(paste(image_Save_Location, "NormalizedEffectDistribution.pdf", sep = ""),
+        normalized_dist,
+        dpi = 300,
+        width = 10,
         height = 10)
+ 
+print(normalized_dist)
+ 
+# ── NEW DYNAMIC DISTRIBUTIONS (per condition / well) ─────────────────────────
+# Each plot is drawn only if its column exists in merged_df and has data, so a
+# missing optional channel is silently skipped instead of erroring. merged_df is
+# one row per condition/well, matching the existing raw/normalized distributions.
+.distr_theme <- theme_classic() +
+  theme(title        = element_text(size = 40, face = "bold"),
+        axis.title.x = element_text(size = 36, face = "bold"),
+        axis.title.y = element_text(size = 30, face = "bold"),
+        axis.text.y  = element_text(size = 30, face = "bold"),
+        axis.text.x  = element_text(size = 30, face = "bold"),
+        axis.ticks.length = unit(0.4, "cm"),
+        axis.ticks   = element_line(size = 1.2))
+ 
+# (1) Cytoplasmic GFP foci COUNT distribution
+if ("CytoFoci_Count" %in% names(merged_df) && any(!is.na(merged_df$CytoFoci_Count))) {
+  cyto_foci_dist <- ggplot(subset(merged_df, !is.na(CytoFoci_Count)),
+                           aes(x = CytoFoci_Count)) +
+    geom_histogram(color = "black", fill = "darkgray", bins = 30) +
+    labs(title = NULL, y = "Count (conditions)", x = "Cytoplasmic GFP Foci / Cell") +
+    .distr_theme
+  ggsave(paste(image_Save_Location, "CytoFociCount_distribution.pdf", sep = ""),
+         cyto_foci_dist, dpi = 300, width = 10, height = 10)
+  print(cyto_foci_dist)
+} else {
+  message("Skipping cytoplasmic-foci-count distribution: column absent or all-NA.")
+}
+ 
+# (2) Nuclear GFP foci INTEGRATED INTENSITY distribution
+if ("NucFoci_IntegratedIntensity" %in% names(merged_df) && any(!is.na(merged_df$NucFoci_IntegratedIntensity))) {
+  nuc_foci_int_dist <- ggplot(subset(merged_df, !is.na(NucFoci_IntegratedIntensity)),
+                              aes(x = NucFoci_IntegratedIntensity)) +
+    geom_histogram(color = "black", fill = "darkgray", bins = 30) +
+    labs(title = NULL, y = "Count (conditions)", x = "Nuclear GFP Foci Integrated Intensity") +
+    .distr_theme
+  ggsave(paste(image_Save_Location, "NucFociIntInt_distribution.pdf", sep = ""),
+         nuc_foci_int_dist, dpi = 300, width = 10, height = 10)
+  print(nuc_foci_int_dist)
+} else {
+  message("Skipping nuclear-foci integrated-intensity distribution: column absent or all-NA.")
+}
+ 
+# (3) tdTomato normalized effect distribution (only if a tdTomato channel exists)
+if (has_td_int && "tdTomato_Diff" %in% names(merged_df) && any(!is.na(merged_df$tdTomato_Diff))) {
+  td_dist_df <- merged_df %>%
+    filter(!is.na(tdTomato_Diff)) %>%
+    mutate(TotalPercentTdTomato = 100 + tdTomato_Diff)
+ 
+  tdTomato_dist <- ggplot(td_dist_df, aes(x = TotalPercentTdTomato)) +
+    geom_histogram(color = "black", fill = "darkgray", binwidth = 4) +
+    geom_density(alpha = 0.6, fill = "darkgray") +
+    geom_vline(aes(xintercept = 100), linetype = "dashed", linewidth = 2.5) +
+    labs(title = NULL, y = "Count (conditions)", x = "tdTomato % of plate mean") +
+    .distr_theme
+ 
+  ggsave(paste(image_Save_Location, "TdTomato_NormalizedEffect_distribution.pdf", sep = ""),
+         tdTomato_dist, dpi = 300, width = 10, height = 10)
+  print(tdTomato_dist)
+} else {
+  message("Skipping tdTomato normalized-effect distribution: no tdTomato channel.")
+}
   
    
 ```
-
-
-
-
-
+ 
+ 
 ```{r}
 ###OPTIONAL###
-
+ 
 # ============================================================
 # HTS Spatial QC - Global Row/Col MEDIAN shifts + Heatmaps
 # Refactored for improved readability and logical flow
 # ============================================================
-
+ 
 # ============================================================
 # 1. CONFIGURATION
 # ============================================================
 #If not previously defined:
 #fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
-
-file_Location    <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/"
-fileX            <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx"
+ 
+file_Location    <- "/nfs/roberts/scratch/pi_cs723/djp94/YCMD/UseChemicalDiversityAll/"
+fileX            <- paste0(file_Location, "CondenScreenV2.xlsx")
 sheetX           <- "Combined Analysis"
 out_dir          <- paste0(file_Location, "HTS_QC_OUT/")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-
+ 
 #Update this value based on the Z-Score or BZ-Score threshold you are using for hit selection. 
 #If hit_threshold <- 2, then any well positions that are called as hits if Z or BZ-Score >= 2. 
 hit_threshold <- 2
@@ -1512,13 +2107,13 @@ hit_threshold <- 2
 alpha_qc <- 0.05
 well_fold_threshold <- 3   # flag well positions hit >= Nx the mean recurrence rate
 score_outlier_sd <- 3      # flag cols/rows whose median BZScore is >n SDs from mean of medians
-
+ 
 # ============================================================
 # 2. HELPERS
 # ============================================================
 save_plot <- function(p, fname, w=12, h=6)
   ggsave(file.path(out_dir, fname), plot=p, width=w, height=h, dpi=300)
-
+ 
 theme_prismish <- function(base_size=12)
   theme_classic(base_size=base_size) +
   theme(plot.title   = element_text(face="bold", size=16),
@@ -1527,7 +2122,7 @@ theme_prismish <- function(base_size=12)
         axis.text.x  = element_text(face="bold", size=14),
         axis.text.y  = element_text(face="bold", size=14),
         panel.grid   = element_blank())
-
+ 
 bar_shift <- function(df_sum, xcol, ycol, title, xlab, ylab, rotate_x=FALSE, ylim=NULL) {
   p <- ggplot(df_sum, aes(x=.data[[xcol]], y=.data[[ycol]])) +
     geom_col(fill="#2E1A47", color="black", linewidth=0.25, width=0.9) +
@@ -1537,7 +2132,7 @@ bar_shift <- function(df_sum, xcol, ycol, title, xlab, ylab, rotate_x=FALSE, yli
   if (rotate_x)        p <- p + theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1))
   p
 }
-
+ 
 heatmap_metric <- function(df_grid, fill_col, title, fill_lab)
   ggplot(df_grid, aes(x=factor(col2), y=row, fill=.data[[fill_col]])) +
   geom_tile(color=NA) +
@@ -1546,11 +2141,11 @@ heatmap_metric <- function(df_grid, fill_col, title, fill_lab)
   theme(axis.text.x=element_text(angle=90, vjust=0.5), legend.position="right") +
   scale_fill_viridis_c(option="viridis", na.value="grey90") +
   guides(fill=guide_colorbar(title.position="top", barwidth=unit(0.5,"cm"), barheight=unit(6,"cm")))
-
+ 
 parse_well <- function(df)
   df %>% mutate(row=str_sub(Well,1,1), col=as.integer(str_remove(Well,"^[A-Za-z]")),
                 col2=sprintf("%02d",col), well_pos=paste0(row,col2))
-
+ 
 chisq_hit_test <- function(df, group_var, hit_col="Hit") {
   counts <- df %>%
     group_by(.data[[group_var]]) %>%
@@ -1561,7 +2156,7 @@ chisq_hit_test <- function(df, group_var, hit_col="Hit") {
                     flagged=global_p < alpha_qc & abs(std_resid) > 2) %>%
     arrange(desc(abs(std_resid)))
 }
-
+ 
 chisq_score_shift <- function(df, group_var, score_col=NULL, n_sd=score_outlier_sd) {
   if (is.null(score_col)) stop("score_col must be specified, e.g. 'BZScore' or 'ZScore'")
   grp_medians <- df %>%
@@ -1581,7 +2176,7 @@ chisq_score_shift <- function(df, group_var, score_col=NULL, n_sd=score_outlier_
     ) %>%
     arrange(desc(abs(z_of_median)))
 }
-
+ 
 # Fold-over-mean recurrence  
 well_recurrence_test <- function(df, hit_col="Hit", fold_threshold=well_fold_threshold) {
   n_pl <- n_distinct(df$Plate)
@@ -1601,7 +2196,7 @@ well_recurrence_test <- function(df, hit_col="Hit", fold_threshold=well_fold_thr
     flagged         = n_plates_as_hit >= threshold
   )
 }
-
+ 
 plot_plate_hits <- function(df, hit_col="Hit", sig_plates=character(0), title="Hits: global plate totals") {
   plate_sum <- df %>% group_by(Plate) %>%
     summarize(hit_sum=sum(.data[[hit_col]]==1, na.rm=TRUE), .groups="drop") %>%
@@ -1614,14 +2209,14 @@ plot_plate_hits <- function(df, hit_col="Hit", sig_plates=character(0), title="H
     labs(title=title, x="Plate", y="Total hits") + theme_prismish() +
     theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1))
 }
-
+ 
 paper_div_impact_clean <- function(lims=c(-2,2), midpoint=0)
   scale_fill_gradientn(
     colours=c("#E00000","#FF7A00","#FFFFFF","#5A0AA4","#1A0033"),
     values=scales::rescale(c(lims[1], lims[1]+(midpoint-lims[1])*0.5, midpoint,
                              midpoint+(lims[2]-midpoint)*0.5, lims[2]), from=lims),
     limits=lims, oob=scales::squish)
-
+ 
 hit_impact_purple_deeper <- function(max_hits, zero_color="#F5F5F5")
   scale_fill_gradientn(
     colours=c(zero_color,"#B8AEC9","#5A3E86","#4A3A73","#1A0033"),
@@ -1629,7 +2224,7 @@ hit_impact_purple_deeper <- function(max_hits, zero_color="#F5F5F5")
                            from=c(0,max_hits)),
     limits=c(0,max_hits), oob=scales::squish,
     guide=guide_colorbar(title="Hits per well", barheight=unit(5,"cm")))
-
+ 
 heatmap_theme_clean <- theme(
   plot.title=element_text(size=16, face="bold", hjust=0),
   axis.title=element_text(size=14, face="bold"),
@@ -1637,14 +2232,14 @@ heatmap_theme_clean <- theme(
   axis.text.y=element_text(size=12, face="bold"),
   legend.title=element_text(size=14, face="bold"),
   legend.text=element_text(size=12, face="bold"))
-
+ 
 # ============================================================
 # 3. LOAD & PREP
 # ============================================================
 df <- read.xlsx(fileX, sheet=sheetX) %>% parse_well()
 if (!("BZScore" %in% colnames(df))) df$BZScore <- NA_real_
 has_bz <- any(!is.na(df$BZScore))
-
+ 
 df <- df %>% mutate(
   Hit  = if ("Hit" %in% colnames(.)) as.integer(Hit)
          else if (has_bz) as.integer(BZScore >= hit_threshold)
@@ -1654,54 +2249,54 @@ df <- df %>% mutate(
                     levels=sprintf("%02d", sort(unique(as.integer(str_remove(Well,"^[A-Za-z]")))))),
   well_pos = factor(well_pos)
 )
-
+ 
 score_metric <- if ("Hit" %in% colnames(df)) "Hit (precomputed)" else if (has_bz) "BZScore" else "ZScore"
 score_col    <- if (has_bz) "BZScore" else "ZScore"
-
+ 
 # ============================================================
 # 4. SUMMARIES
 # ============================================================
 summarize_by <- function(df, grp, ...) df %>% group_by(.data[[grp]]) %>% summarize(..., .groups="drop")
-
+ 
 row_z  <- summarize_by(df,"row",  med_z=median(ZScore,na.rm=TRUE))
 row_bz <- summarize_by(df,"row",  med_bz=median(BZScore,na.rm=TRUE))
 row_h  <- summarize_by(df,"row",  hit_sum=sum(Hit,na.rm=TRUE))
 col_z  <- summarize_by(df,"col2", med_z=median(ZScore,na.rm=TRUE))
 col_bz <- summarize_by(df,"col2", med_bz=median(BZScore,na.rm=TRUE))
 col_h  <- summarize_by(df,"col2", hit_sum=sum(Hit,na.rm=TRUE))
-
+ 
 grid_sum <- df %>% group_by(row,col2) %>%
   summarize(med_z=median(ZScore,na.rm=TRUE), med_bz=median(BZScore,na.rm=TRUE),
             hit_sum=sum(Hit,na.rm=TRUE), .groups="drop")
-
+ 
 plate_row_stats <- df %>% group_by(Plate,row) %>%
   summarize(n=n(), med_z=median(ZScore,na.rm=TRUE), med_bz=median(BZScore,na.rm=TRUE),
             hit_sum=sum(Hit,na.rm=TRUE), .groups="drop")
 plate_col_stats <- df %>% group_by(Plate,col2) %>%
   summarize(n=n(), med_z=median(ZScore,na.rm=TRUE), med_bz=median(BZScore,na.rm=TRUE),
             hit_sum=sum(Hit,na.rm=TRUE), .groups="drop")
-
+ 
 # ============================================================
 # 5. TESTS
 # ============================================================
 test_row_hit         <- chisq_hit_test(df,"row")
 test_col_hit         <- chisq_hit_test(df,"col2")
 test_plate_hit       <- chisq_hit_test(df, "Plate")
-
+ 
 test_well_recurrence <- well_recurrence_test(df, fold_threshold=well_fold_threshold)
 test_col_score_shift <- chisq_score_shift(df, "col2", score_col=score_col)
 test_row_score_shift <- chisq_score_shift(df, "row",  score_col=score_col)
-
+ 
 sig_rows_hit     <- test_row_hit         %>% filter(flagged) %>% pull(row)      %>% as.character()
 sig_cols_hit     <- test_col_hit         %>% filter(flagged) %>% pull(col2)     %>% as.character()
 sig_plates_hit   <- test_plate_hit %>% filter(flagged) %>% pull(Plate) %>% as.character()
 recurrent_wells  <- test_well_recurrence %>% filter(flagged) %>% pull(well_pos) %>% as.character()
 sig_cols_score   <- test_col_score_shift %>% filter(flagged) %>% pull(col2)     %>% as.character()
 sig_rows_score   <- test_row_score_shift %>% filter(flagged) %>% pull(row)      %>% as.character()
-
+ 
 col_direction <- test_col_score_shift %>% filter(flagged) %>% select(col2, direction) %>% deframe()
 row_direction <- test_row_score_shift %>% filter(flagged) %>% select(row,  direction) %>% deframe()
-
+ 
 cat("Flagged rows:", length(sig_rows_hit), "| cols:", length(sig_cols_hit),
     "| score-outlier rows:", length(sig_rows_score), "| score-outlier cols:", length(sig_cols_score),
     "| wells:", length(recurrent_wells), "| plates:", length(sig_plates_hit), "\n")
@@ -1711,7 +2306,7 @@ cat("Flagged rows:", length(sig_rows_hit), "| cols:", length(sig_cols_hit),
 lim_val  <- function(x) { v <- max(abs(x), na.rm=TRUE); ifelse(is.finite(v) && v>0, v, 1) }
 ylim_row <- c(-1,1) * lim_val(c(row_z$med_z, row_bz$med_bz))
 ylim_col <- c(-1,1) * lim_val(c(col_z$med_z, col_bz$med_bz))
-
+ 
 p_row_z <- bar_shift(row_z,  "row",  "med_z",   "ZScore: global row shift (median)",  "Row",    "Median ZScore",  ylim=ylim_row)
 p_row_h <- bar_shift(row_h,  "row",  "hit_sum", "Hits: global row totals",             "Row",    "Total hits")
 p_col_z <- bar_shift(col_z,  "col2", "med_z",   "ZScore: global col shift (median)",  "Column", "Median ZScore",  rotate_x=TRUE, ylim=ylim_col)
@@ -1720,36 +2315,36 @@ if (has_bz) {
   p_row_bz <- bar_shift(row_bz, "row",  "med_bz", "BZScore: global row shift (median)", "Row",    "Median BZScore", ylim=ylim_row)
   p_col_bz <- bar_shift(col_bz, "col2", "med_bz", "BZScore: global col shift (median)", "Column", "Median BZScore", rotate_x=TRUE, ylim=ylim_col)
 }
-
+ 
 p_heat_z   <- heatmap_metric(grid_sum,"med_z",  "Heatmap: Median Z-Score by Well Position",   "Median Z-Score")  + paper_div_impact_clean() + heatmap_theme_clean + scale_y_discrete(limits=rev)
 p_heat_hit <- heatmap_metric(grid_sum,"hit_sum","Heatmap: Total Hits by Well Position",        "Total hits")      + hit_impact_purple_deeper(max(grid_sum$hit_sum,na.rm=TRUE)) + heatmap_theme_clean + scale_y_discrete(limits=rev)
 if (has_bz)
   p_heat_bz <- heatmap_metric(grid_sum,"med_bz","Heatmap: Median BZ-Score by Well Position",  "Median BZ-Score") + paper_div_impact_clean() + heatmap_theme_clean + scale_y_discrete(limits=rev)
-
+ 
 p_plate_h <- plot_plate_hits(df, sig_plates=sig_plates_hit,
                              title="Hits: global plate totals (significant plates marked *)")
 h_rc <- if (has_bz) 12 else 9
-
+ 
 row_fig <- {
   if (has_bz) (p_row_z/p_row_bz/p_row_h) + plot_layout(heights=c(1,1,1))
   else        (p_row_z/p_row_h)           + plot_layout(heights=c(1,1))
 } + plot_annotation(title="Global Row QC")
-
+ 
 col_fig <- {
   if (has_bz) (p_col_z/p_col_bz/p_col_h) + plot_layout(heights=c(1,1,1))
   else        (p_col_z/p_col_h)           + plot_layout(heights=c(1,1))
 } + plot_annotation(title="Global Column QC")
-
+ 
 heat_fig <- {
   if (has_bz) (p_heat_z/p_heat_bz/p_heat_hit) + plot_layout(heights=c(1,1,1))
   else        (p_heat_z/p_heat_hit)             + plot_layout(heights=c(1,1))
 }
-
+ 
 save_plot(row_fig,   "QC_ROWS_combined.png",  w=14, h=h_rc)
 save_plot(col_fig,   "QC_COLS_combined.png",  w=14, h=h_rc)
 save_plot(heat_fig,  "QC_HEAT_combined.png",  w=12, h=if(has_bz) 12 else 9)
 save_plot(p_plate_h, "QC_PLATES_hits.png",    w=14, h=7)
-
+ 
 # ============================================================
 # 7. QC ANNOTATION
 # ============================================================
@@ -1770,7 +2365,7 @@ type_string <- function(pl, r, c, wp) {
   if (length(out)==0) return("None")
   paste(unique(out), collapse="; ")
 }
-
+ 
 hits_df_qc <- df %>% filter(Hit==1) %>%
   mutate(Type_of_Error    = purrr::pmap_chr(list(Plate,row,col2,well_pos), type_string),
          Systematic_error = ifelse(Type_of_Error=="None","No","Yes"),
@@ -1782,7 +2377,7 @@ hits_df_qc <- df %>% filter(Hit==1) %>%
   select(-any_of(c("Hit","QC_row_score","QC_col_score","QC_well_score","QC_row_hit","QC_col_hit",
                    "QC_well_hit","QC_score_flag","QC_hit_flag","Systematic_plate_error",
                    "Systematic_error_type","QC_score_metric_used")))
-
+ 
 # ============================================================
 # 8. EXPORT
 # ============================================================
@@ -1794,10 +2389,10 @@ writeData(orig_wb, "Hits_QC", hits_out)
 freezePane(orig_wb, "Hits_QC", firstRow=TRUE)
 addFilter(orig_wb,  "Hits_QC", rows=1, cols=1:ncol(hits_out))
 saveWorkbook(orig_wb, fileX, overwrite=TRUE)
-
+ 
 wb <- createWorkbook()
 write_df <- function(s, x) { addWorksheet(wb,s); writeData(wb,s,x) }
-
+ 
 write_df("HITS_with_QC_flags",         hits_df_qc)
 write_df("TEST_plate_chisq_hit",       test_plate_hit)
 write_df("TEST_row_chisq_hit",         test_row_hit)
@@ -1810,36 +2405,60 @@ write_df("global_col_medians",  left_join(col_z,col_bz,by="col2") %>% left_join(
 write_df("global_grid",         grid_sum)
 write_df("plate_row_stats",     plate_row_stats)
 write_df("plate_col_stats",     plate_col_stats)
-
+ 
 saveWorkbook(wb, file.path(out_dir,"HTS_QC_RESULTS.xlsx"), overwrite=TRUE)
 invisible(NULL)
-
+ 
+ 
 ```
-)
-
-
+ 
+ 
+ 
 ```{r}
 ###OPTIONAL###
 # ============================================================
 # Configuration
 # ============================================================
+ 
+# --- Resolve a Python with RDKit: conda env if available, else pip virtualenv ---
+activated <- FALSE
+ 
+# 1) Try conda env first, but only if reticulate can actually find conda
+conda_bin <- tryCatch(reticulate::conda_binary(), error = function(e) "")
+if (nzchar(conda_bin)) {
+  activated <- tryCatch({
+    reticulate::use_condaenv("rdkit-env", conda = conda_bin, required = TRUE)
+    TRUE
+  }, error = function(e) FALSE)
+}
+ 
+# 2) Fall back to a pip virtualenv ONLY if conda didn't work; create it ONLY if missing
+if (!activated) {
+  if (!reticulate::virtualenv_exists("rdkit-env")) {
+    reticulate::virtualenv_create("rdkit-env", packages = "rdkit")
+  }
+  reticulate::use_virtualenv("rdkit-env", required = TRUE)
+}
+ 
+reticulate::py_config()                       # confirm interpreter
+Chem <- reticulate::import("rdkit.Chem")
 #Path to previously exported datasheet.
-save_Location <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/"
-
+save_Location <- "/nfs/roberts/scratch/pi_cs723/djp94/YCMD/UseChemicalDiversityAll/"
+ 
 #Saves cached smiles, if available, to avoid re-querying PubChem/CACTUS
 CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
-
+ 
 # ============================================================
-
+ 
 # 1) Load and merge data
 #If not previously defined:
-fileX   <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/CondenScreenV2.xlsx"
+fileX   <- paste0(save_Location, "CondenScreenV2.xlsx")
 #Note: the drug/gene/identifier must be name Reference (it automatically will be unless changed)
-
+ 
 # 1) Load and merge data + build hits sheet (if needed_)
 sheet_hits <- "Hits"
 wb <- loadWorkbook(fileX)  # must load before referencing names(wb)
-
+ 
 if (!sheet_hits %in% names(wb)) {
   # Build hits_df and write new sheet
   hits_df <- if (assayType == "OFF") {
@@ -1853,26 +2472,26 @@ if (!sheet_hits %in% names(wb)) {
 } else {
   hits_df <- read.xlsx(fileX, sheet = sheet_hits)
 }
-
-
+ 
+ 
 df_merged <-  hits_df %>%
   mutate(Reference = trimws(as.character(Reference)))
-
+ 
 #Determines if reference already has SMILES chemical string available
 has_smiles <- "SMILES" %in% colnames(df_merged) &&
               any(nzchar(trimws(df_merged$SMILES)), na.rm = TRUE)
-
+ 
 df_merged <- df_merged %>%
   mutate(
     CAS    = if ("CAS" %in% colnames(.)) as.character(CAS) else NA_character_,
     SMILES = if ("SMILES" %in% colnames(.)) as.character(SMILES) else NA_character_
   )
-
+ 
 # ============================================================
 # 2) Cache management
 # ============================================================
 smiles_cache <- new.env(parent = emptyenv())
-
+ 
 if (file.exists(CACHE_PATH)) {
   cache_df <- readr::read_tsv(CACHE_PATH, show_col_types = FALSE)
   if (nrow(cache_df) > 0) {
@@ -1880,15 +2499,15 @@ if (file.exists(CACHE_PATH)) {
                  ~ assign(.x, .y, envir = smiles_cache))
   }
 }
-
+ 
 cache_get <- function(key) {
   if (exists(key, envir = smiles_cache, inherits = FALSE)) 
     get(key, envir = smiles_cache) 
   else NULL
 }
-
+ 
 cache_set <- function(key, value) assign(key, value, envir = smiles_cache)
-
+ 
 cache_flush <- function() {
   keys <- ls(smiles_cache, all.names = TRUE)
   if (length(keys) > 0) {
@@ -1898,11 +2517,8 @@ cache_flush <- function() {
     ) %>% readr::write_tsv(CACHE_PATH)
   }
 }
-
-#Activate the RDKit Python environment
-conda_Path <- as.character(conda_list()[conda_list()$name == "rdkit-env", "python"])
-use_condaenv(conda_Path, required = TRUE)
-
+ 
+ 
 # Only then import
 Chem <- import("rdkit.Chem")
 RDLogger <- import("rdkit.RDLogger")
@@ -1910,7 +2526,7 @@ RDLogger$DisableLog("rdApp.*")
 # ============================================================
 # 3) Identifier cleaning and SMILES retrieval
 # ============================================================
-
+ 
 #clean_cas -- experimental: Will try to increase the chance PubChem/CACTUS recognizes your CAS. May need adjustment on case-by-case basis
 clean_cas <- function(x) {
   
@@ -1923,8 +2539,8 @@ clean_cas <- function(x) {
   is_cas <- grepl("^\\d{2,7}-\\d{2}-\\d$", parts)
   if (any(is_cas)) parts[which(is_cas)[1]] else parts[1]
 }
-
-
+ 
+ 
 #clean SMILES:
 normalize_key <- function(x) {
   if (is.na(x)) return(NA_character_)
@@ -1933,7 +2549,7 @@ normalize_key <- function(x) {
   x <- trimws(x)
   tolower(x)
 }
-
+ 
 sanitize_smiles <- function(smi) {
   if (is.na(smi) || !nzchar(trimws(smi))) return(NA_character_)
   smi <- trimws(smi)
@@ -1941,20 +2557,20 @@ sanitize_smiles <- function(smi) {
   smi <- gsub("\\|", ".", smi)
   smi
 }
-
+ 
 #Try parse SMILES into an RDKit molecule, else NULL
 safe_mol <- function(smi) {
   if (is.na(smi) || !nzchar(trimws(smi))) return(NULL)
   tryCatch(Chem$MolFromSmiles(trimws(smi)), error = function(e) NULL)
 }
-
+ 
 is_valid_smiles <- function(smi) {
   mol <- safe_mol(smi)
   !is.null(mol)
 }
-
-
-
+ 
+ 
+ 
 #Returning SMILES:
 #--------
 #Will try to parse PubChem first for SMILES...
@@ -1979,15 +2595,15 @@ pubchem_smiles <- function(id, namespace = c("name", "rn"), timeout_s = 20) {
   if (is.null(smi) || is.na(smi) || !nzchar(smi)) smi <- props$CanonicalSMILES[1]
   if (is.null(smi) || is.na(smi) || !nzchar(smi)) NA_character_ else smi
 }
-
-
+ 
+ 
 #... but if fails will resort to CACTUS, NCI Chemical Identifier Resolver: https://cactus.nci.nih.gov/chemical/structure
 cactus_smiles <- function(id, timeout_s = 20) {
   if (is.na(id) || !nzchar(trimws(id))) return(NA_character_)
-
+ 
   url <- sprintf("https://cactus.nci.nih.gov/chemical/structure/%s/smiles",
                  URLencode(id, reserved = TRUE))
-
+ 
   for (k in 1:3) {
     resp <- tryCatch(request(url) |> req_timeout(timeout_s) |> req_perform(),
                      error = function(e) NULL)
@@ -2001,15 +2617,15 @@ cactus_smiles <- function(id, timeout_s = 20) {
   }
   NA_character_
 }
-
+ 
 get_smiles <- function(cas, name) {
   cas1  <- clean_cas(cas)
   name1 <- if (is.na(name) || !nzchar(trimws(name))) NA_character_ else trimws(name)
-
+ 
   # normalized cache keys
   key_rn <- if (!is.na(cas1)) paste0("RN:", normalize_key(cas1)) else NULL
   key_nm <- if (!is.na(name1)) paste0("NM:", normalize_key(name1)) else NULL
-
+ 
   # ---- cache check (use normalized keys only)
   for (key in c(key_rn, key_nm)) {
     if (!is.null(key)) {
@@ -2022,27 +2638,27 @@ get_smiles <- function(cas, name) {
       if (!is.null(cached) && identical(cached, "NA")) return(NA_character_)
     }
   }
-
+ 
   # ---- retrieval
   smi <- NA_character_
   if (!is.na(cas1)) smi <- pubchem_smiles(cas1, "rn")
   if (is.na(smi) && !is.na(name1)) smi <- pubchem_smiles(name1, "name")
   if (is.na(smi) && !is.na(cas1)) smi <- cactus_smiles(cas1)
   if (is.na(smi) && !is.na(name1)) smi <- cactus_smiles(name1)
-
+ 
   # ---- sanitize + validate
   smi <- sanitize_smiles(smi)
   if (!is.na(smi) && !is_valid_smiles(smi)) smi <- NA_character_
-
+ 
   # ---- cache (normalized keys only)
   if (!is.null(key_rn)) cache_set(key_rn, ifelse(is.na(smi), "NA", smi))
   if (!is.null(key_nm)) cache_set(key_nm, ifelse(is.na(smi), "NA", smi))
-
+ 
   smi
 }
  
 #--------
-
+ 
 # Retrieve SMILES for all compounds
 #Remove whitespace and replace with NA
 df_hits <- df_merged %>%
@@ -2053,29 +2669,29 @@ df_hits <- df_merged %>%
       as.character(Reference)
     )
   )
-
+ 
 # Identify rows that actually need lookup 
 need_lookup <- with(
   df_hits,
   (is.na(SMILES) | !nzchar(trimws(SMILES))) &
   !(is.na(CAS) & is.na(Reference))
 )
-
+ 
 n_lookup <- sum(need_lookup)
-
+ 
 if (n_lookup > 0) {
-
+ 
   idx <- which(need_lookup)
-
+ 
   message("Retrieving SMILES for ", n_lookup, " compounds")
-
+ 
   pb <- progress::progress_bar$new(
     format = "Compound :current/:total [:bar] :percent | eta: :eta",
     total  = length(idx),
     clear  = FALSE,
     width  = 60
   )
-
+ 
   df_hits$SMILES[idx] <- vapply(
     idx,
     function(i) {
@@ -2084,21 +2700,21 @@ if (n_lookup > 0) {
     },
     character(1)
   )
-
+ 
   cache_flush()
-
+ 
 } else {
   message("All compounds already have SMILES — no lookup performed")
 }
-
+ 
 #Diagnostic to determine how well CAS/SMILES search worked
 sum(is.na(df_hits$CAS) & is.na(df_hits$Reference))
-
-
+ 
+ 
 # ============================================================
 # 4) RDKit setup and molecular processing
 # ============================================================
-
+ 
 #Import modules for describing molecular descriptors (e.g., molc. weight), cLogP, Lipinski counts, and safeguard measures.
 Desc <- import("rdkit.Chem.Descriptors")
 Crip <- import("rdkit.Chem.Crippen")
@@ -2106,9 +2722,9 @@ Lip <- import("rdkit.Chem.Lipinski")
 rdMS <- import("rdkit.Chem.MolStandardize.rdMolStandardize")
 uncharger <- rdMS$Uncharger()
 largest_frag <- rdMS$LargestFragmentChooser()
-
-
-
+ 
+ 
+ 
 #Try to edit SMILES format to reflect canonical SMILES [avoids salt charges, keeps largest fragment, etc.]
 canonicalize_parent <- function(smiles) {
   if (is.na(smiles) || !nzchar(trimws(smiles))) return(NA_character_)
@@ -2122,7 +2738,7 @@ canonicalize_parent <- function(smiles) {
   tryCatch(Chem$MolToSmiles(mol, canonical = TRUE, kekuleSmiles = FALSE),
            error = function(e) NA_character_)
 }
-
+ 
 # Process SMILES for property calculations
 df_hits <- df_hits %>%
   as_tibble() %>%
@@ -2136,20 +2752,20 @@ df_hits <- df_hits %>%
 # ============================================================
 # 5) Load structural alerts
 # ============================================================
-
+ 
 #All credit for the initial chemical alerts goes to Pat Walters.
 #See Pat Walter's GitHub, rd_fitlers, for more information: https://github.com/PatWalters/rd_filters.git
 #The csv file can alternatively be downloaded directly with the rest of the CondenScreen code in https://github.com/SchliekerLab/Condenscreen-v1.1.git
-
-
-
-
+ 
+ 
+ 
+ 
 get_alerts <- function(cache_dir = "nuisance_cache",
                        local_file = "alert_collection_PatWalters.csv") {
   dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
   f_cache <- file.path(cache_dir, "alert_collection.csv")
   url <- "https://raw.githubusercontent.com/PatWalters/rd_filters/master/rd_filters/data/alert_collection.csv"
-
+ 
   # ---- Prefer local file, then cached file, else download ----
   if (file.exists(local_file)) {
     message("Using local alert file: ", local_file)
@@ -2162,31 +2778,31 @@ get_alerts <- function(cache_dir = "nuisance_cache",
     download.file(url, f_cache, mode = "wb")
     al <- read.csv(f_cache, stringsAsFactors = FALSE)
   }
-
+ 
   # ---- Detect column names (robust to schema changes) ----
   nms <- names(al)
-
+ 
   smarts_col <- nms[grep("smarts", nms, ignore.case = TRUE)][1]
-
+ 
   # rule_set numeric (e.g., 2,3,4...) if present
   rule_set_col <- nms[grep("^rule.?set$|rule_set", nms, ignore.case = TRUE)][1]
-
+ 
   # rule_set_name (e.g., PAINS, Glaxo, GSK...) if present
   set_name_col <- nms[grep("rule.?set.?name|set_name|ruleset_name|rule_set_name", nms, ignore.case = TRUE)][1]
-
+ 
   # rule_id numeric
   id_col <- nms[grep("^rule.?id$|rule_id", nms, ignore.case = TRUE)][1]
-
+ 
   # description/name field (human readable), best-effort
   desc_col <- nms[grep("description|desc|name|alert_name|label", nms, ignore.case = TRUE)][1]
-
+ 
   if (is.na(smarts_col) || is.na(id_col) || (is.na(rule_set_col) && is.na(set_name_col))) {
     stop(
       "Could not detect required columns in alert CSV. Found columns: ",
       paste(nms, collapse = ", ")
     )
   }
-
+ 
   # ---- Normalize ----
   alerts <- dplyr::as_tibble(al) %>%
     dplyr::transmute(
@@ -2218,7 +2834,7 @@ get_alerts <- function(cache_dir = "nuisance_cache",
         paste0(alert_id, " | ", rule_set_name)
       )
     )
-
+ 
   # ---- Split and compile patterns ----
   split(alerts, alerts$rule_set_name) %>%
     purrr::map(function(d) {
@@ -2235,9 +2851,9 @@ get_alerts <- function(cache_dir = "nuisance_cache",
         dplyr::filter(!purrr::map_lgl(patt, is.null))
     })
 }
-
+ 
 compiled_sets <- get_alerts()
-
+ 
 flag_molecule <- function(smi, compiled_sets) {
   mol <- safe_mol(smi)
   if (is.null(mol)) return("")
@@ -2260,8 +2876,8 @@ flag_molecule <- function(smi, compiled_sets) {
     paste(unique(hits), collapse = " | ")
   }
 }
-
-
+ 
+ 
 calc_lipinski <- function(smi) {
   mol <- safe_mol(smi)
   if (is.null(mol)) {
@@ -2302,36 +2918,36 @@ calc_lipinski <- function(smi) {
 unique_smiles <- df_hits %>%
   filter(!is.na(SMILES_used), SMILES_used != "") %>%
   distinct(SMILES_used)
-
+ 
 cat("Computing properties for", nrow(unique_smiles), "unique SMILES...\n")
 smis <- unique_smiles$SMILES_used
 n <- length(smis)
-
+ 
 pb <- progress::progress_bar$new(
   format = "RDKit [:bar] :current/:total :percent | eta: :eta",
   total  = n,
   clear  = FALSE,
   width  = 60
 )
-
+ 
 properties_list <- vector("list", n)
-
+ 
 for (i in seq_len(n)) {
   pb$tick()
-
+ 
   smi <- smis[i]
-
+ 
   flags <- flag_molecule(smi, compiled_sets)
   props <- calc_lipinski(smi)
-
+ 
   properties_list[[i]] <- cbind(
     tibble::tibble(SMILES_used = smi, alert_flags = flags),
     props
   )
 }
-
+ 
 properties_tbl <- dplyr::bind_rows(properties_list)
-
+ 
 # ============================================================
 # 7) Join properties and calculate risk scores
 # ============================================================
@@ -2342,9 +2958,9 @@ properties_tbl <- dplyr::bind_rows(properties_list)
 # artificial inflation when multiple related alerts are triggered.
 # The PAINS/MLSMR/BMS/GSK/Glaxo/LINT/Dundee/Inpharmatica/SureChEMBL are based on the the ChEMBL database and Pat Walters work.
 # See https://github.com/PatWalters/rd_filters.git
-
+ 
 # Tier definitions:
-
+ 
 #   Score 10 (ELEVATED):
 #     - PAINS compounds 
 #     - Cytotoxicity (≥25% viability loss)
@@ -2356,15 +2972,15 @@ properties_tbl <- dplyr::bind_rows(properties_list)
 #   Score 2 (MINOR):
 #     - Lipinski rule-of-five violations
 #     - Inpharmatica / SureChEMBL alerts
-
+ 
 # Risk categories:
 #   10  -> "ELEVATED"
 #   5   -> "MODERATE"
 #   2   -> "MINOR"
 #   0   -> "CLEAN"
-
+ 
 # -------------------------------------------------------------------------
-
+ 
 df_final <- df_hits %>%
   left_join(properties_tbl, by = "SMILES_used", suffix = c(".old", "")) %>%
   select(-ends_with(".old")) %>%
@@ -2375,20 +2991,20 @@ df_final <- df_hits %>%
       if ("residual" %in% names(.)) is.na(residual) else TRUE
   } else FALSE,
     
-
+ 
     Cytotoxic = !is.na(Viability) & (Viability <= -25),
-
+ 
     has_smiles = !is.na(SMILES_used) & nzchar(trimws(SMILES_used)),
     flags = if_else(has_smiles, coalesce(alert_flags, ""), ""),
-
+ 
     # --- Flag categories ---
     High_Flag = grepl("PAINS", flags, ignore.case = TRUE) | Cytotoxic,
-
+ 
     Moderate_Flag = grepl("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE) | TdTomato,
-
+ 
     Mild_Flag = grepl("INPHARMATICA|SURECHEMBL", flags, ignore.case = TRUE) |
                 (!is.na(Lipinski_Failed) & Lipinski_Failed > 0),
-
+ 
     # --- Max-based score ---
     AlertScore = pmax(
       if_else(High_Flag, 10L, 0L),
@@ -2410,7 +3026,7 @@ df_final <- df_hits %>%
 chem_cols_chr <- c("flags", "Lipinski", "Lipinski_Failed")
 chem_cols_num <- c("AlertScore", "MW", "LogP", "HBD", "HBA")
 chem_cols_lgl <- c("PAINS_NIH_Flagged", "Industry_Flagged", "Other_Flagged")
-
+ 
 df_final <- df_final %>%
   mutate(
     across(any_of(chem_cols_num), ~ if_else(has_smiles, .x, NA_real_)),
@@ -2418,8 +3034,8 @@ df_final <- df_final %>%
     across(any_of(chem_cols_lgl), ~ if_else(has_smiles, .x, NA))
   ) %>%
   select(-has_smiles)
-
-
+ 
+ 
 #Select important columns for exporting:
 df_final <- df_final %>%
   select(any_of(c(
@@ -2434,56 +3050,45 @@ df_final <- df_final %>%
 # ============================================================
 # 8) Write back to Excel
 # ============================================================
-
+ 
 #Overwrite previous hits sheet in original workbook to add chemical triage labels:
-
+ 
 sheet_hits <- "Hits"
-
+ 
 # (optional) make factors safe for Excel
 df_final <- df_final %>% mutate(across(where(is.factor), as.character))
-
+ 
 # 2) Load the existing workbook and overwrite the Hits sheet
 wb <- loadWorkbook(fileX)
-
-
+ 
+ 
 if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
 addWorksheet(wb, sheet_hits)
-
+ 
 #Order by BZ-Score (descending)
 df_final <- df_final %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
 writeData(wb, sheet_hits, df_final, startCol = 1, startRow = 1, colNames = TRUE)
-
+ 
 freezePane(wb, sheet_hits, firstActiveRow = 2)
 addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(df_final))
-
+ 
 # Desired sheets (in order)
 new_order <- c("Hits", "Combined Analysis", "Plate Statistics", "Controls")
-
+ 
 # Remove unwanted sheets
 for (sh in setdiff(names(wb), new_order)) {
   removeWorksheet(wb, sh)
 }
-
+ 
 # Reorder by matching positions
 worksheetOrder(wb) <- match(new_order, names(wb))
-
-
+ 
+ 
 saveWorkbook(wb, fileX, overwrite = TRUE)
-
-# 1. What is actually driving sig_cols_score?
-cat("sig_cols_score:", sig_cols_score, "\n")
-cat("sig_rows_score:", sig_rows_score, "\n")
-
-# 2. What does recurrence look like for N03?
-test_well_recurrence %>% summarize(mean(n_plates_as_hit))
-
-# 3. What's the actual threshold?
-cat("n plates:", n_distinct(df$Plate), "\n")
-cat("threshold:", max(2, ceiling(n_distinct(df$Plate) * well_recurrence_pct)), "\n")
-
-
+ 
+ 
 ```
-
+  
 ```{r}
 # RDKit imports
 rdkit       <- import("rdkit")
@@ -2492,36 +3097,53 @@ AllChem     <- rdkit$Chem$AllChem
 DataStructs <- rdkit$DataStructs
 Draw        <- import("rdkit.Chem.Draw")
 MolDrawing  <- import("rdkit.Chem.Draw.rdMolDraw2D")
-
+ 
 # ── Output directory ───────────────────────────────────────────────────────────
-out_dir <- "/Users/dylan/Documents/chemical_screen/results_4_11_26/" 
+out_dir <- save_Location
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-
-
+ 
+ 
+# ── Restrict Tanimoto/cheminformatics analysis to confirmed hits ────────────────
+# Only compounds with BZ/Z-Score > 3 that pass viability (Viability >= -50) and,
+# if a tdTomato channel exists, pass the tdTomato filter. This mirrors the
+# viab_ok / td_ok conventions used elsewhere (TdTomato here is the "failed"
+# drop flag, so passing == !TdTomato).
+score_col_chem <- if ("BZScore" %in% names(df_final)) "BZScore" else "ZScore"
+ 
+df_chem <- df_final %>%
+  filter(
+    .data[[score_col_chem]] > 3,
+    is.na(Viability) | Viability >= -50,
+    if (has_td_int && "TdTomato" %in% names(.)) (is.na(TdTomato) | !TdTomato) else TRUE
+  )
+ 
+message("Cheminformatics: ", nrow(df_chem), " of ", nrow(df_final),
+        " hits pass BZ/Z>3, viability, and tdTomato filters.")
+ 
 # ── Molecular Fingerprinting ───────────────────────────────────────────────────────────────
-fps <- lapply(df_final$SMILES_used, function(smi) {
+fps <- lapply(df_chem$SMILES_used, function(smi) {
   mol <- Chem$MolFromSmiles(smi)
   if (is.null(mol)) return(NULL)
   AllChem$GetMorganFingerprintAsBitVect(mol, radius = 2L, nBits = 2048L)
 })
 valid <- !sapply(fps, is.null)
 fps   <- fps[valid]
-refs  <- df_final$Reference[valid]
-
-
+refs  <- df_chem$Reference[valid]
+ 
+ 
 # ── Tanimoto similarity matrix ─────────────────────────────────────────────────
 n <- length(fps)
 sim_matrix <- matrix(0, n, n, dimnames = list(refs, refs))
 for (i in seq_len(n))
   for (j in seq_len(n))
     sim_matrix[i, j] <- DataStructs$TanimotoSimilarity(fps[[i]], fps[[j]])
-
+ 
 # ── Palette ────────────────────────────────────────────────────────────────────
 diverging_owp    <- colorRampPalette(c("#E87D3E", "#F5C9A0", "white", "#9B8EC4", "#3B2A6E"))(100)
 sequential_pdark <- colorRampPalette(c("#F5D0D8", "#C98BAA", "#7B3F7A", "#3A1050", "#0F0318"))(100)
 bar_fill         <- "darkgray"
 umap_colors <- c("NT Ctrl" = "#F4A8B0", "RNF26" = "#F5C89A", "ZNF335" = "#C8B8E0")
-
+ 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 make_legend <- function(ref, hits_df) {
   row <- hits_df %>% filter(Reference == ref)
@@ -2529,34 +3151,103 @@ make_legend <- function(ref, hits_df) {
          " | td:", sprintf("%.1f", row$tdTomato_Diff))
 }
 strip_name <- function(mol) { mol$SetProp("_Name", ""); mol }
-
+ 
 opts <- MolDrawing$MolDrawOptions()
 opts$legendFontSize <- 22L
 opts$legendFraction <- 0.15
 opts$padding        <- 0.05
-
+ 
 # ── Mol objects ────────────────────────────────────────────────────────────────
-mols       <- lapply(df_final$SMILES_used, function(smi) Chem$MolFromSmiles(smi))
+mols       <- lapply(df_chem$SMILES_used, function(smi) Chem$MolFromSmiles(smi))
 valid_mol  <- !sapply(mols, is.null)
 mols_valid <- mols[valid_mol]
-refs_valid <- df_final$Reference[valid_mol]
-
+refs_valid <- df_chem$Reference[valid_mol]
+ 
 #------------------------
 #Figure Generation:
 #------------------------
-
+# Turn whatever MolsToGridImage returns into a PNG file on disk
+grid_png_to_file <- function(obj, path) {
+  if (is.raw(obj)) { writeBin(obj, path); return(invisible(path)) }
+  rawc <- tryCatch(reticulate::py_to_r(obj), error = function(e) NULL)
+  if (is.raw(rawc)) { writeBin(rawc, path); return(invisible(path)) }
+  if (inherits(obj, "python.builtin.bytes")) {            # your case: write via Python
+    bi  <- reticulate::import_builtins()
+    con <- bi$open(path, "wb"); con$write(obj); con$close()
+    return(invisible(path))
+  }
+  if (!is.null(tryCatch(obj$save, error = function(e) NULL))) {  # PIL Image fallback
+    obj$save(path); return(invisible(path))
+  }
+  stop("Unrecognized MolsToGridImage return: ", paste(class(obj), collapse = ", "))
+}
+# ── Structural clustering (Butina / Taylor-Butina) ──────────────────────────────
+# Butina clustering greedily picks centroids with the most neighbors within the
+# distance cutoff, giving compact, centroid-based clusters. This is more
+# defensible than a simple similarity-threshold graph (igraph::components),
+# which performs single-linkage clustering and can chain compounds together
+# transitively even when the endpoints aren't very similar to each other.
+# Computed up-front (before the MDS plot) so cluster membership can be used
+# to color the MDS scatter.
+Butina <- import("rdkit.ML.Cluster.Butina")
+ 
+# Tanimoto DISTANCE cutoff (1 - similarity). 0.6 distance == 0.4 similarity,
+# matching the threshold used previously.
+cluster_cutoff <- 0.7
+ 
+n_chem <- length(refs_valid)
+if (n_chem >= 2) {
+  dist_vec <- numeric(n_chem * (n_chem - 1) / 2)
+  k <- 1L
+  for (i in 2:n_chem) {
+    for (j in 1:(i - 1)) {
+      dist_vec[k] <- 1 - sim_matrix[i, j]
+      k <- k + 1L
+    }
+  }
+} else {
+  dist_vec <- numeric(0)
+}
+ 
+butina_clusters <- Butina$ClusterData(dist_vec, n_chem, cluster_cutoff, isDistData = TRUE)
+ 
+# The first index in each Butina tuple is the cluster centroid (the compound
+# with the most neighbors within the cutoff) -- a natural structural
+# representative for that cluster.
+cluster_all_df <- bind_rows(lapply(seq_along(butina_clusters), function(g) {
+  idx <- unlist(butina_clusters[[g]]) + 1L  # python 0-based -> R 1-based
+  data.frame(
+    Reference      = refs_valid[idx],
+    Group          = g,
+    Representative = c(TRUE, rep(FALSE, length(idx) - 1)),
+    stringsAsFactors = FALSE
+  )
+})) %>% arrange(Group)
+ 
+# Multi-compound clusters only, for the IMAGE 5 structure grid
+component_df <- cluster_all_df %>%
+  group_by(Group) %>% filter(n() > 1) %>% ungroup() %>% arrange(Group)
+ 
+cluster_summary <- component_df %>%
+  group_by(Group) %>%
+  summarize(n = n(), compounds = paste(Reference, collapse = ", "))
+ 
 # ── IMAGE 1: Heatmap ───────────────────────────────────────────────────────────
 #Convert from similarity to distance matrix for heatmap clustering:
 tanimoto_dist <- as.dist(1 - sim_matrix)
-
-png(file.path(out_dir, "tanimoto_heatmap.png"), width = 1400, height = 1200, res = 150)
+ 
+png(file.path(out_dir, "tanimoto_heatmap.png"), width = 2800, height = 2400, res = 300)
 pheatmap(sim_matrix,                        # still display the similarity values
          clustering_distance_rows = tanimoto_dist,
          clustering_distance_cols = tanimoto_dist,
          clustering_method = "ward.D2",
-         color = diverging_owp)
+         color = diverging_owp,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         fontsize_row = 5,
+         fontsize_col = 5)
 dev.off()
-
+ 
 # ── IMAGE 2: Similarity distribution ──────────────────────────────────────────
 sim_vals <- melt(sim_matrix) %>% filter(Var1 != Var2)
 p_dist <- ggplot(sim_vals, aes(x = value)) +
@@ -2566,169 +3257,230 @@ p_dist <- ggplot(sim_vals, aes(x = value)) +
        x = "Tanimoto Similarity", y = "Count") +
   theme_classic()
 ggsave(file.path(out_dir, "tanimoto_distribution.png"), p_dist, width = 8, height = 5, dpi = 150)
-
-# ── IMAGE 4: UMAP scatter ──────────────────────────────────────────────────────
-umap_config <- umap.defaults
-umap_config$metric      <- "euclidean"   # or use 1-sim_matrix and "precomputed"
-umap_config$n_neighbors <- 10            # reasonable for ~50-100 compounds
-umap_config$min_dist    <- 0.2
-umap_config$random_state <- 42
-
+ 
+# ── IMAGE 3: MDS (PCoA) scatter ─────────────────────────────────────────────────
+# UMAP is unstable/unreliable for small N. Classical MDS (cmdscale) on the
+# Tanimoto distance matrix is deterministic and behaves sensibly at any N.
+# Column names kept as UMAP1/UMAP2/umap_df to avoid disrupting the Excel export.
 dist_matrix <- 1 - sim_matrix
-umap_res <- umap(dist_matrix, config = umap_config)
-umap_df  <- data.frame(UMAP1 = umap_res$layout[, 1], UMAP2 = umap_res$layout[, 2],
-                       Reference = rownames(sim_matrix))
-p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, label = Reference)) +
-  geom_point(color = bar_fill, size = 2) +
-  geom_text_repel(size = 3) +
-  theme_classic() +
-  labs(title = "UMAP of Chemical Fingerprint Similarity")
-ggsave(file.path(out_dir, "umap_scatter.png"), p_umap, width = 8, height = 6, dpi = 150)
-
-# ── IMAGE 5: All hits structure grid ──────────────────────────────────────────
+n_items     <- nrow(dist_matrix)
+ 
+if (n_items >= 3) {
+  mds_res <- cmdscale(as.dist(dist_matrix), k = min(2L, n_items - 1L))
+ 
+  if (ncol(mds_res) < 2) mds_res <- cbind(mds_res, 0)  # guard for k=1 edge case
+ 
+  umap_df <- data.frame(UMAP1 = mds_res[, 1],
+                         UMAP2 = mds_res[, 2],
+                         Reference = rownames(sim_matrix))
+  p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, label = Reference)) +
+    geom_point(color = bar_fill, size = 2) +
+    geom_text_repel(size = 3) +
+    theme_classic() +
+    labs(title = "MDS (PCoA) of Chemical Fingerprint Similarity",
+         x = "MDS1", y = "MDS2")
+  ggsave(file.path(out_dir, "umap_scatter.png"), p_umap, width = 8, height = 6, dpi = 150)
+} else {
+  message("Too few compounds (", n_items, ") for a meaningful MDS plot -- skipping plot.")
+  umap_df <- data.frame(UMAP1 = NA_real_, UMAP2 = NA_real_,
+                        Reference = rownames(sim_matrix))   # keeps the Excel sheet working
+}
+ 
+# ── IMAGE 3b: MDS scatter colored by structural (Butina) cluster ───────────────
+# Same MDS embedding as IMAGE 3, but colored by Butina cluster membership so
+# you can see at a glance which hits are structurally related. Singletons
+# (clusters of size 1) are grouped into a single "Unclustered" category and
+# shown in gray so the discrete color scale isn't dominated by one-off groups.
+if (n_items >= 3 && exists("cluster_all_df")) {
+  cluster_sizes <- cluster_all_df %>% count(Group)
+  multi_groups  <- cluster_sizes$Group[cluster_sizes$n > 1]
+ 
+  umap_cluster_df <- umap_df %>%
+    left_join(cluster_all_df %>% select(Reference, Group), by = "Reference") %>%
+    mutate(
+      ClusterLabel = if_else(Group %in% multi_groups,
+                              paste0("Cluster ", Group),
+                              "Unclustered")
+    )
+ 
+  # Stable color assignment: real clusters get the qualitative palette,
+  # "Unclustered" is always gray regardless of how many clusters exist.
+  named_levels <- sort(unique(umap_cluster_df$ClusterLabel[umap_cluster_df$ClusterLabel != "Unclustered"]))
+  cluster_levels <- c(named_levels, "Unclustered")
+ 
+  cluster_colors <- if (length(named_levels) > 0) scales::hue_pal()(length(named_levels)) else character(0)
+  cluster_palette <- setNames(c(cluster_colors, "gray70"), cluster_levels)
+ 
+  umap_cluster_df$ClusterLabel <- factor(umap_cluster_df$ClusterLabel, levels = cluster_levels)
+ 
+  p_umap_clusters <- ggplot(umap_cluster_df, aes(x = UMAP1, y = UMAP2, label = Reference, color = ClusterLabel)) +
+    geom_point(size = 2) +
+    geom_text_repel(size = 3, show.legend = FALSE) +
+    scale_color_manual(values = cluster_palette) +
+    theme_classic() +
+    labs(title = "MDS (PCoA) Colored by Structural Cluster (Butina)",
+         x = "MDS1", y = "MDS2", color = "Cluster")
+  ggsave(file.path(out_dir, "mds_scatter_clusters.png"), p_umap_clusters, width = 9, height = 6, dpi = 150)
+} else {
+  message("Skipping cluster-colored MDS plot (too few compounds or no cluster data).")
+}
+ 
+# ── IMAGE 4: All hits structure grid ──────────────────────────────────────────
 legends_all <- sapply(refs_valid, make_legend, hits_df = df_merged)
 mols_clean  <- lapply(mols_valid, strip_name)
-img_bytes <- Draw$MolsToGridImage(mols_clean, molsPerRow = 6L, subImgSize = c(600L, 500L),
-                                  legends = as.list(unname(legends_all)),
-                                  drawOptions = opts, returnPNG = TRUE)
-writeBin(as.raw(img_bytes), file.path(out_dir, "hits_structures.png"))
-
-# ── Similarity-based clusters ──────────────────────────────────────────────────
-sim_long <- melt(sim_matrix) %>%
-  filter(Var1 != Var2, value > 0.4) %>%
-  mutate(Var1 = as.character(Var1), Var2 = as.character(Var2))
-g     <- graph_from_data_frame(sim_long, directed = FALSE,
-                               vertices = data.frame(name = refs_valid))
-comps <- components(g)
-component_df <- data.frame(Reference = names(comps$membership), Group = comps$membership) %>%
-  group_by(Group) %>% filter(n() > 1) %>% ungroup() %>% arrange(Group)
-cluster_summary <- component_df %>%
-  group_by(Group) %>%
-  summarize(n = n(), compounds = paste(Reference, collapse = ", "))
-
-# ── IMAGE 6: Grouped structure grid ───────────────────────────────────────────
-# ── IMAGE 6: One row per cluster, structures + text separated via magick ───────
-
+ 
+img_obj <- Draw$MolsToGridImage(mols_clean, molsPerRow = 6L, subImgSize = c(600L, 500L),
+                                legends = as.list(unname(legends_all)),
+                                drawOptions = opts, returnPNG = TRUE)
+#writeBin(grid_png_raw(img_obj), file.path(out_dir, "hits_structures.png"))
+grid_png_to_file(img_obj, file.path(out_dir, "hits_structures.png"))
+ 
+# ── IMAGE 5: One row per cluster, structures + text separated via magick ───────
+library(magick)
+ 
+ 
 groups_unique <- sort(unique(component_df$Group))
-
-cluster_images <- lapply(groups_unique, function(grp) {
-  
-  # ── Compounds in this cluster ────────────────────────────────────────────────
-  refs_in_grp <- component_df$Reference[component_df$Group == grp]
-  idx_in_grp  <- match(refs_in_grp, refs_valid)
-  valid_idx   <- !is.na(idx_in_grp)
-  refs_in_grp <- refs_in_grp[valid_idx]
-  idx_in_grp  <- idx_in_grp[valid_idx]
-  n_in_grp    <- length(refs_in_grp)
-  
-  # ── 1. Draw structures with no legend ───────────────────────────────────────
-  mols_grp     <- lapply(mols_valid[idx_in_grp], strip_name)
-  blank_legs   <- as.list(rep("", n_in_grp))
-  
-  struct_bytes <- Draw$MolsToGridImage(
-    mols_grp,
-    molsPerRow  = as.integer(n_in_grp),
-    subImgSize  = c(600L, 500L),
-    legends     = blank_legs,
-    drawOptions = opts,
-    returnPNG   = TRUE
-  )
-  struct_img <- image_read(as.raw(struct_bytes))
-  struct_w   <- image_info(struct_img)$width
-  cell_w     <- as.integer(struct_w / n_in_grp)
-  
-  # ── 2. Build text panel for each compound ───────────────────────────────────
-  text_panels <- lapply(seq_len(n_in_grp), function(i) {
-    ref <- refs_in_grp[i]
-    row <- df_merged %>% filter(Reference == ref)
-    
-    # Pairwise Tanimoto vs every other compound in cluster
-    others    <- setdiff(seq_len(n_in_grp), i)
-    tan_lines <- sapply(others, function(j) {
-      t_val <- DataStructs$TanimotoSimilarity(fps[[idx_in_grp[i]]], fps[[idx_in_grp[j]]])
-      sprintf("  vs %s:  %.2f", refs_in_grp[j], t_val)
-    })
-    
-    lines <- c(
-      ref,
-      sprintf("Eff: %.1f  |  td: %.1f", row$PercentEffect, row$tdTomato_Diff),
-      "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
-      "Tanimoto:",
-      tan_lines
-    )
-    text_block <- paste(lines, collapse = "\n")
-    n_lines    <- length(lines)
-    panel_h    <- 30 + n_lines * 28
-    
-    image_blank(cell_w, panel_h, color = "white") %>%
-      image_annotate(
-        text     = text_block,
-        gravity  = "NorthWest",
-        location = "+20+12",
-        size     = 22,
-        color    = "#222222",
-        font     = "DejaVu-Sans"
+ 
+groups_unique <- sort(unique(component_df$Group))
+ 
+if (length(groups_unique) == 0) {
+  message("No multi-compound clusters (Tanimoto > 0.4) -- skipping grouped structure grid.")
+} else {
+ 
+  # image_annotate() runs text through ImageMagick's MVG "text" primitive,
+  # which can choke on quotes/percent signs/newlines in compound names and
+  # throw "non-conforming drawing primitive definition `text'". Side-step
+  # that entirely by rendering text with base R graphics (png + text()) and
+  # reading the result back in as an image. Defined here (shared scope) so
+  # both the per-compound text panels and the cluster banners can use it.
+  safe_text <- function(x) {
+    x <- as.character(x)
+    x[is.na(x)] <- ""
+    x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "")
+    gsub("[\r\n\t]", " ", x)
+  }
+ 
+  make_banner <- function(text, width_px, height_px = 50) {
+    tmp_banner <- tempfile(fileext = ".png")
+ 
+    png(tmp_banner, width = width_px, height = height_px, bg = "#EDE9F5", res = 120)
+    par(mar = c(0, 0, 0, 0), xaxs = "i", yaxs = "i")
+    plot.new()
+    plot.window(xlim = c(0, width_px), ylim = c(height_px, 0))
+ 
+    text(x = 16, y = height_px / 2, labels = safe_text(text), adj = c(0, 0.5),
+         cex = 1.6, col = "#3B2A6E", font = 2, family = "sans")
+ 
+    dev.off()
+    image_read(tmp_banner)
+  }
+ 
+  cluster_images <- lapply(groups_unique, function(grp) {
+ 
+    # ── Compounds in this cluster ──────────────────────────────────────────────
+    refs_in_grp <- component_df$Reference[component_df$Group == grp]
+    idx_in_grp  <- match(refs_in_grp, refs_valid)
+    valid_idx   <- !is.na(idx_in_grp)
+    refs_in_grp <- refs_in_grp[valid_idx]
+    idx_in_grp  <- idx_in_grp[valid_idx]
+    n_in_grp    <- length(refs_in_grp)
+ 
+    # ── 1. Draw structures with no legend ──────────────────────────────────────
+    mols_grp   <- lapply(mols_valid[idx_in_grp], strip_name)
+    blank_legs <- as.list(rep("", n_in_grp))
+ 
+    struct_obj <- Draw$MolsToGridImage(mols_grp, molsPerRow = as.integer(n_in_grp),
+                                       subImgSize = c(600L, 500L), legends = blank_legs,
+                                       drawOptions = opts, returnPNG = TRUE)
+    tmp_png    <- tempfile(fileext = ".png")
+    grid_png_to_file(struct_obj, tmp_png)
+    struct_img <- image_read(tmp_png)
+    struct_w   <- image_info(struct_img)$width
+    cell_w     <- as.integer(struct_w / n_in_grp)
+ 
+    # ── 2. Build text panel for each compound ──────────────────────────────────
+    make_text_panel <- function(lines, width_px, height_px, fontsize = 22) {
+      tmp_txt <- tempfile(fileext = ".png")
+ 
+      png(tmp_txt, width = width_px, height = height_px, bg = "white", res = 120)
+      par(mar = c(0, 0, 0, 0), xaxs = "i", yaxs = "i")
+      plot.new()
+      plot.window(xlim = c(0, width_px), ylim = c(height_px, 0))
+ 
+      y <- 28
+      for (ln in lines) {
+        text(x = 20, y = y, labels = safe_text(ln), adj = c(0, 0),
+             cex = fontsize / 18, col = "#222222", family = "sans")
+        y <- y + 30
+      }
+ 
+      dev.off()
+      image_read(tmp_txt)
+    }
+ 
+    text_panels <- lapply(seq_len(n_in_grp), function(i) {
+      ref <- refs_in_grp[i]
+      row <- df_merged %>% filter(Reference == ref) %>% slice(1)
+ 
+      eff_val <- if ("PercentEffect" %in% names(row)) row$PercentEffect[1] else NA_real_
+      td_val  <- if ("tdTomato_Diff" %in% names(row)) row$tdTomato_Diff[1] else NA_real_
+ 
+      others    <- setdiff(seq_len(n_in_grp), i)
+      tan_lines <- sapply(others, function(j) {
+        t_val <- DataStructs$TanimotoSimilarity(fps[[idx_in_grp[i]]], fps[[idx_in_grp[j]]])
+        sprintf("  vs %s:  %.2f", refs_in_grp[j], t_val)
+      })
+ 
+      lines <- c(
+        ref,
+        sprintf("Eff: %.1f  |  td: %.1f", eff_val, td_val),
+        strrep("-", 20),
+        "Tanimoto:",
+        tan_lines
       )
+      panel_h <- 40 + length(lines) * 30
+ 
+      make_text_panel(lines = lines, width_px = cell_w, height_px = panel_h, fontsize = 22)
+    })
+ 
+    # ── 3. Stitch text panels side by side ─────────────────────────────────────
+    text_row <- image_append(do.call(c, text_panels), stack = FALSE)
+    text_w   <- image_info(text_row)$width
+    if (text_w < struct_w) {
+      text_row <- image_extent(text_row,
+                               geometry = paste0(struct_w, "x", image_info(text_row)$height),
+                               gravity = "West", color = "white")
+    }
+ 
+    # ── 4. Stack structures on top of text ─────────────────────────────────────
+    image_append(c(struct_img, text_row), stack = TRUE)
   })
-  
-  # ── 3. Stitch text panels side by side ──────────────────────────────────────
-  text_row <- image_append(do.call(c, text_panels), stack = FALSE)
-  
-  # Pad text row to match structure image width if needed
-  text_w <- image_info(text_row)$width
-  if (text_w < struct_w) {
-    text_row <- image_extent(
-      text_row,
-      geometry = paste0(struct_w, "x", image_info(text_row)$height),
-      gravity  = "West",
-      color    = "white"
-    )
-  }
-  
-  # ── 4. Stack structure image on top of text row ──────────────────────────────
-  image_append(c(struct_img, text_row), stack = TRUE)
-})
-
-# ── Add cluster banners and stack all rows vertically ────────────────────────
-max_width <- max(sapply(cluster_images, function(img) image_info(img)$width))
-
-final_rows <- lapply(seq_along(cluster_images), function(i) {
-  grp <- groups_unique[i]
-  n   <- sum(component_df$Group == grp)
-  img <- cluster_images[[i]]
-  
-  # Pad to uniform width
-  if (image_info(img)$width < max_width) {
-    img <- image_extent(
-      img,
-      geometry = paste0(max_width, "x", image_info(img)$height),
-      gravity  = "West",
-      color    = "white"
-    )
-  }
-  
-  # Cluster label banner
-  banner <- image_blank(max_width, 50, color = "#EDE9F5") %>%
-    image_annotate(
-      text     = sprintf("Cluster %d  (%d compounds)", grp, n),
-      gravity  = "West",
-      location = "+16+0",
-      size     = 26,
-      color    = "#3B2A6E",
-      font     = "DejaVu-Sans",
-      weight   = 700
-    )
-  
-  image_append(c(banner, img), stack = TRUE)
-})
-
-final_img <- image_append(do.call(c, final_rows), stack = TRUE)
-image_write(final_img, file.path(out_dir, "hits_structures_grouped.png"))
-message("Saved: hits_structures_grouped.png")
-
+ 
+  # ── Banners + stack all rows ─────────────────────────────────────────────────
+  max_width  <- max(sapply(cluster_images, function(img) image_info(img)$width))
+  final_rows <- lapply(seq_along(cluster_images), function(i) {
+    grp <- groups_unique[i]
+    n   <- sum(component_df$Group == grp)
+    img <- cluster_images[[i]]
+ 
+    if (image_info(img)$width < max_width) {
+      img <- image_extent(img, geometry = paste0(max_width, "x", image_info(img)$height),
+                          gravity = "West", color = "white")
+    }
+ 
+    banner <- make_banner(text = sprintf("Cluster %d  (%d compounds)", grp, n),
+                          width_px = max_width, height_px = 50)
+ 
+    image_append(c(banner, img), stack = TRUE)
+  })
+ 
+  final_img <- image_append(do.call(c, final_rows), stack = TRUE)
+  image_write(final_img, file.path(out_dir, "hits_structures_grouped.png"))
+  message("Saved: hits_structures_grouped.png")
+}
 # ── EXCEL EXPORT ───────────────────────────────────────────────────────────────
 wb <- createWorkbook()
-
+ 
 header_style    <- createStyle(fontName = "Arial", fontSize = 11, fontColour = "white",
                                fgFill = "#3B2A6E", halign = "center",
                                textDecoration = "bold", border = "Bottom")
@@ -2737,7 +3489,7 @@ cell_style      <- createStyle(fontName = "Arial", fontSize = 10, numFmt = "0.00
 cell_style_text <- createStyle(fontName = "Arial", fontSize = 10, halign = "left")
 cell_style_num  <- createStyle(fontName = "Arial", fontSize = 10, numFmt = "0.0000", halign = "right")
 cell_style_int  <- createStyle(fontName = "Arial", fontSize = 10, numFmt = "0", halign = "center")
-
+ 
 # ── Sheet 1: Tanimoto Similarity Matrix ───────────────────────────────────────
 addWorksheet(wb, "Tanimoto Similarity")
 sim_df <- cbind(Reference = rownames(sim_matrix), as.data.frame(sim_matrix))
@@ -2755,7 +3507,7 @@ setColWidths(wb, "Tanimoto Similarity", cols = 1,
              widths = max(nchar(as.character(sim_df$Reference))) * 1.2 + 2)
 setColWidths(wb, "Tanimoto Similarity", cols = 2:n_cols, widths = 10)
 freezePane(wb, "Tanimoto Similarity", firstRow = TRUE, firstCol = TRUE)
-
+ 
 # ── Sheet 2: UMAP Results ─────────────────────────────────────────────────────
 addWorksheet(wb, "UMAP Results")
 writeData(wb, "UMAP Results", umap_df, startRow = 1, startCol = 1,
@@ -2768,49 +3520,181 @@ addStyle(wb, "UMAP Results", style = cell_style_num,
 setColWidths(wb, "UMAP Results", cols = 1, widths = 25)
 setColWidths(wb, "UMAP Results", cols = 2:3, widths = 14)
 freezePane(wb, "UMAP Results", firstRow = TRUE, firstCol = FALSE)
-
+ 
 # ── Sheet 3: Cluster Assignments ───────────────────────────────────────────────
+# Includes ALL Butina clusters (singletons too), plus:
+#   - Representative: structural centroid of the cluster (most neighbors within
+#     the Tanimoto distance cutoff)
+#   - Score: BZ/Z-Score (whichever applies) for the compound
+#   - Hit: TRUE if the compound's Score exceeds 3 (Z- or BZ-Score, whichever
+#     column applies for this run).
 addWorksheet(wb, "Clusters")
-cluster_export <- component_df %>%
-  left_join(df_merged %>% select(Reference, PercentEffect, tdTomato_Diff), by = "Reference") %>%
-  arrange(Group, Reference)
+cluster_export <- cluster_all_df %>%
+  left_join(df_merged %>% select(any_of(c("Reference", "PercentEffect", "tdTomato_Diff"))), by = "Reference") %>%
+  left_join(df_chem %>% select(Reference, Score = all_of(score_col_chem)), by = "Reference") %>%
+  group_by(Group) %>%
+  mutate(Hit = Score > 3) %>%
+  ungroup() %>%
+  arrange(Group, desc(Score))
 cluster_export$Group <- as.integer(cluster_export$Group)
 writeData(wb, "Clusters", cluster_export, startRow = 1, startCol = 1,
           headerStyle = header_style, borders = "surrounding")
-n_cluster_rows <- nrow(cluster_export)
+n_cluster_rows  <- nrow(cluster_export)
+n_cluster_cols  <- ncol(cluster_export)
+cluster_colnames <- names(cluster_export)
+ 
+# Numeric columns vary depending on whether tdTomato_Diff exists for this run
+numeric_cols <- match(intersect(c("PercentEffect", "tdTomato_Diff", "Score"), cluster_colnames),
+                       cluster_colnames)
+ 
 addStyle(wb, "Clusters", style = cell_style_text,
-         rows = 2:(n_cluster_rows + 1), cols = 1, gridExpand = TRUE)
+         rows = 2:(n_cluster_rows + 1), cols = match("Reference", cluster_colnames), gridExpand = TRUE)
 addStyle(wb, "Clusters", style = cell_style_int,
-         rows = 2:(n_cluster_rows + 1), cols = 2, gridExpand = TRUE)
+         rows = 2:(n_cluster_rows + 1), cols = match("Group", cluster_colnames), gridExpand = TRUE)
 addStyle(wb, "Clusters", style = cell_style_num,
-         rows = 2:(n_cluster_rows + 1), cols = 3:4, gridExpand = TRUE)
-
-
-
+         rows = 2:(n_cluster_rows + 1), cols = numeric_cols, gridExpand = TRUE)
+ 
+ 
+ 
 # Alternating row shading by cluster group
 groups <- cluster_export$Group
 for (i in seq_len(n_cluster_rows)) {
   if (groups[i] %% 2 == 0)
-    addStyle(wb, "Clusters", rows = i + 1, cols = 1:4, gridExpand = TRUE, stack = TRUE,
+    addStyle(wb, "Clusters", rows = i + 1, cols = 1:n_cluster_cols, gridExpand = TRUE, stack = TRUE,
              style = createStyle(fgFill = "#EDE9F5", fontName = "Arial", fontSize = 10))
 }
-
-writeData(wb, "Clusters", cluster_summary, startRow = 1, startCol = 6,
+ 
+summary_start_col <- n_cluster_cols + 2
+writeData(wb, "Clusters", cluster_summary, startRow = 1, startCol = summary_start_col,
           headerStyle = header_style, borders = "surrounding")
-setColWidths(wb, "Clusters", cols = 1,   widths = 25)
-setColWidths(wb, "Clusters", cols = 2,   widths = 10)
-setColWidths(wb, "Clusters", cols = 3:4, widths = 16)
-setColWidths(wb, "Clusters", cols = 6:8, widths = c(10, 8, 40))
+setColWidths(wb, "Clusters", cols = match("Reference", cluster_colnames), widths = 25)
+setColWidths(wb, "Clusters", cols = match("Group", cluster_colnames), widths = 10)
+setColWidths(wb, "Clusters", cols = numeric_cols, widths = 14)
+if ("Representative" %in% cluster_colnames)
+  setColWidths(wb, "Clusters", cols = match("Representative", cluster_colnames), widths = 14)
+if ("Hit" %in% cluster_colnames)
+  setColWidths(wb, "Clusters", cols = match("Hit", cluster_colnames), widths = 10)
+setColWidths(wb, "Clusters", cols = summary_start_col:(summary_start_col + 2), widths = c(10, 8, 40))
 freezePane(wb, "Clusters", firstRow = TRUE)
-
+ 
 # ── Save workbook ──────────────────────────────────────────────────────────────
 saveWorkbook(wb, file.path(out_dir, "cheminformatics_results.xlsx"), overwrite = TRUE)
-
+ 
 message("Export complete:")
 message("  Images: tanimoto_heatmap.png, tanimoto_distribution.png, pca_scatter.png,")
 message("umap_scatter.png, hits_structures.png, hits_structures_grouped.png")
 message("  Excel:  cheminformatics_results.xlsx (3 sheets: Tanimoto Similarity, UMAP Results, Clusters)")
 ```
-
-
-
+ 
+```{r}
+# ============================================================
+# FINAL: Export Hits + QC + Chemical Filtering (consolidated)
+# ============================================================
+# The cheminformatics chunk above ends by deleting every worksheet not in
+# c("Hits","Combined Analysis","Plate Statistics","Controls") -- which wipes
+# out "Export Hits" (written in the NORMALIZED SCORE PLOT chunk) and "Hits_QC"
+# (written in the spatial-QC chunk), even though both still exist as R objects
+# (export_hits_df, hits_df_qc). This chunk restores those two sheets and adds a
+# third: "Export Hits Annotated", which is export_hits_df left-joined with the
+# spatial-QC flags and the chemical-filtering report, restricted to the wells
+# that made it into Export Hits, for one-stop downstream triage.
+ 
+if (exists("export_hits_df") && exists("fileX") && file.exists(fileX)) {
+ 
+  # Spatial QC columns, keyed on Plate/Well (Hits_QC is derived from the
+  # "Combined Analysis" sheet via hit_threshold, a different/looser cut than
+  # Export Hits, so this is a left join -- not every Export Hits row will have
+  # a QC match, and that's fine: NA here just means "not flagged by spatial QC").
+  qc_cols <- if (exists("hits_df_qc")) {
+    hits_df_qc %>%
+      mutate(across(where(is.factor), as.character)) %>%
+      select(any_of(c("Plate", "Well", "Type_of_Error", "Systematic_error",
+                       "QC_alpha", "QC_well_fold_threshold", "QC_score_outlier_sd"))) %>%
+      distinct(Plate, Well, .keep_all = TRUE)
+  } else {
+    tibble::tibble(Plate = character(), Well = character())
+  }
+ 
+  # Chemical-filtering columns, keyed on Plate/Well (df_final is the "Hits"
+  # sheet -- BZ/Z >= 3 -- enriched with SMILES/Lipinski/structural-alert risk).
+  chem_cols <- if (exists("df_final")) {
+    df_final %>%
+      mutate(across(where(is.factor), as.character)) %>%
+      select(any_of(c("Plate", "Well", "Risk", "AlertScore", "alert_flags",
+                       "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
+                       "CAS", "SMILES_used", "TdTomato", "Cytotoxic"))) %>%
+      distinct(Plate, Well, .keep_all = TRUE)
+  } else {
+    tibble::tibble(Plate = character(), Well = character())
+  }
+ 
+  export_hits_annotated <- export_hits_df %>%
+    left_join(qc_cols,   by = c("Plate", "Well")) %>%
+    left_join(chem_cols, by = c("Plate", "Well")) %>%
+    arrange(desc(.data[[score_col]]))
+ 
+  wb_final <- loadWorkbook(fileX)
+ 
+  # Re-add "Export Hits" / "Hits_QC" (removed by the cheminformatics cleanup
+  # step) to the main workbook. The consolidated "Export Hits Annotated"
+  # table goes into its own standalone workbook (see below), not in here.
+  for (s in c("Export Hits", "Hits_QC", "TriagedHits")) {
+    if (s %in% names(wb_final)) removeWorksheet(wb_final, s)
+  }
+ 
+  addWorksheet(wb_final, "Export Hits")
+  writeData(wb_final, "Export Hits", export_hits_df, startCol = 1, startRow = 1, colNames = TRUE)
+  freezePane(wb_final, "Export Hits", firstActiveRow = 2)
+  addFilter(wb_final, "Export Hits", rows = 1, cols = 1:ncol(export_hits_df))
+ 
+  if (exists("hits_df_qc")) {
+    hits_qc_out <- hits_df_qc %>% mutate(across(where(is.factor), as.character))
+    addWorksheet(wb_final, "Hits_QC")
+    writeData(wb_final, "Hits_QC", hits_qc_out)
+    freezePane(wb_final, "Hits_QC", firstRow = TRUE)
+    addFilter(wb_final, "Hits_QC", rows = 1, cols = 1:ncol(hits_qc_out))
+  }
+ 
+  # Also add the consolidated Export Hits + QC + chemical-filtering table as
+  # its own sheet in the main workbook (same content as the standalone
+  # "_ExportHitsAnnotated.xlsx" workbook written below).
+  addWorksheet(wb_final, "TriagedHits")
+  writeData(wb_final, "TriagedHits", export_hits_annotated, startCol = 1, startRow = 1, colNames = TRUE)
+  freezePane(wb_final, "TriagedHits", firstActiveRow = 2)
+  addFilter(wb_final, "TriagedHits", rows = 1, cols = 1:ncol(export_hits_annotated))
+ 
+  # Keep "TriagedHits"/"Export Hits"/"Hits_QC" up front, everything else in a sensible order.
+  final_order <- c("TriagedHits", "Export Hits", "Hits_QC",
+                    "Hits", "Combined Analysis", "Plate Statistics", "Controls")
+  final_order <- c(final_order[final_order %in% names(wb_final)],
+                    setdiff(names(wb_final), final_order))
+  worksheetOrder(wb_final) <- match(final_order, names(wb_final))
+ 
+  saveWorkbook(wb_final, fileX, overwrite = TRUE)
+ 
+  # --- Standalone "Export Hits Annotated" workbook -------------------------
+  # A brand-new spreadsheet whose primary table is export_hits_annotated:
+  # the Export Hits rows, left-joined with spatial-QC flags and the chemical-
+  # filtering report, restricted to wells that made it into Export Hits.
+  annotated_file <- file.path(
+    dirname(fileX),
+    paste0(tools::file_path_sans_ext(basename(fileX)), "_ExportHitsAnnotated.xlsx")
+  )
+ 
+  wb_annotated <- createWorkbook()
+  addWorksheet(wb_annotated, "Export Hits Annotated")
+  writeData(wb_annotated, "Export Hits Annotated", export_hits_annotated, startCol = 1, startRow = 1, colNames = TRUE)
+  freezePane(wb_annotated, "Export Hits Annotated", firstActiveRow = 2)
+  addFilter(wb_annotated, "Export Hits Annotated", rows = 1, cols = 1:ncol(export_hits_annotated))
+ 
+  saveWorkbook(wb_annotated, annotated_file, overwrite = TRUE)
+ 
+  cat("Export Hits Annotated workbook written:", annotated_file, "--",
+      nrow(export_hits_annotated),
+      "rows (Export Hits joined with spatial-QC flags and chemical-filtering report)\n")
+ 
+} else {
+  message("Skipping consolidated Export Hits sheet: export_hits_df or fileX not found in this session.")
+}
+```
+ 
