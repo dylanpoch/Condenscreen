@@ -382,6 +382,7 @@ shinyApp(ui = ui, server = server)
 ```
 
 
+
 ```{r}
 process_batch <- function(batch_row, file_Location) {
   batch_number <- batch_row$batch[[1]]
@@ -531,9 +532,13 @@ process_batch <- function(batch_row, file_Location) {
 #EDIT: Add path to recently saved .csv file:
 #############################################################  
 #Make sure all pathways use foward slash (/)!
-#save_Location <- "/home/userX/pathsource/"
-save_Location <-"/nfs/roberts/scratch/pi_cs723/djp94/YCMD/UseChemicalDiversityAll/"
-file_Location<- save_Location
+# Single source of truth for where your exported CondenScreen files live.
+# Edit this once -- every chunk below that needs to bootstrap from disk
+# (i.e. before dfSelection itself has been loaded) reuses this same value
+# instead of re-hardcoding the path.
+project_data_dir <- "/home/userX/pathsource/"
+save_Location <- project_data_dir
+file_Location <- save_Location
 #############################################################
 
 dfSelection <-  fread(paste0(save_Location, "well_selection.csv"))
@@ -553,9 +558,23 @@ add_trailing_slash <- function(filePath) {
 
 image_Save_Location <- add_trailing_slash(dfSelection$SaveDirectory[1])
 file_Location <- add_trailing_slash(dfSelection$InputDirectory[1])
-assayType <- dfSelection$SignalStatus[1]
+assayType <- dfSelection$SignalStatus[1]        # "ON" / "OFF" -- reporter signal direction only
 pos_Ctrl <- dfSelection$PositiveControlName[1]
 neg_Ctrl <- dfSelection$NegativeControlName[1]
+
+# Score type (Z-score vs BZ-score) is set independently in the GUI -- it does
+# NOT follow from SignalStatus. useBZ/score_col are the single source of truth
+# used everywhere downstream instead of repeating `assayType == "OFF"` as a
+# stand-in for "use BZ-score".
+scoreType <- dfSelection$ScoreType[1]           # "Z-score" / "BZ-score"
+useBZ     <- identical(scoreType, "BZ-score")
+score_col <- if (useBZ) "BZScore" else "ZScore"
+
+# Secondary marker (e.g. a reporter like tdTomato) is also set independently in
+# the GUI. useSecondaryMarker gates whether secondary-marker readouts are
+# computed at all, on top of the per-run data-presence check further below.
+secondaryMarkerStatus <- dfSelection$SecondaryMarkerStatus[1]  # "ON" / "OFF"
+useSecondaryMarker    <- identical(secondaryMarkerStatus, "ON")
 
 rows <- dfSelection$PlateRows[1]
 cols <- dfSelection$PlateCols[1]
@@ -642,10 +661,6 @@ batch_files <- file.path(file_Location, paste0("batch_", manifest$batch, ".csv")
 combined_data <- rbindlist(lapply(batch_files, fread, showProgress = FALSE), fill = TRUE)
 fwrite(combined_data, file.path(file_Location, "final_combined_result.csv"), na = "")
 cat("Combined:", nrow(combined_data), "rows across", length(batch_files), "batches\n")
-
-# ── tdTomato presence flags (for downstream use) ──────────────────────────────
-has_tdTomato <- "Intensity_IntegratedIntensity_tdTomato" %in% names(combined_data) &&
-                any(!is.na(combined_data$Intensity_IntegratedIntensity_tdTomato))
 
 
 ```
@@ -768,13 +783,21 @@ rename_if_present <- function(dt, from, to) {
 rename_if_present(combined_Df, "NucFoci",                                 "Children_GFP_foci_Count")  # per-cell nuclear foci count
 rename_if_present(combined_Df, "Nuc_Area",                                "AreaShape_Area")           # nucleus area
 rename_if_present(combined_Df, "Nuc_FormFactor",                          "AreaShape_FormFactor")     # nucleus form factor
-rename_if_present(combined_Df, "Intensity_IntegratedIntensity_tdTomato",  "Intensity_IntegratedIntensity_P2A_tdTomato")
-rename_if_present(combined_Df, "AreaShape_Area_tdTomato",                  "AreaShape_Area_P2A_tdTomato")
+# NOTE: the "from" names below are literal CellProfiler export column names
+# (tied to the actual channel/reporter used, e.g. tdTomato) and must stay as-is
+# for the rename to match real input files. Everything downstream of this point
+# uses the generic "SecondaryMarker" name instead, regardless of which reporter
+# was actually used upstream.
+rename_if_present(combined_Df, "Intensity_IntegratedIntensity_tdTomato",  "Intensity_IntegratedIntensity_P2A_SecondaryMarker")
+rename_if_present(combined_Df, "AreaShape_Area_tdTomato",                  "AreaShape_Area_P2A_SecondaryMarker")
 
 # Presence flags: column exists AND has at least one non-NA value.
 has_col <- function(dt, x) x %in% names(dt) && any(!is.na(dt[[x]]))
-has_td_int        <- has_col(combined_Df, "Intensity_IntegratedIntensity_P2A_tdTomato")
-has_td_area       <- has_col(combined_Df, "AreaShape_Area_P2A_tdTomato")
+# Secondary-marker readouts require BOTH the GUI toggle to be ON and the data
+# to actually be present -- these are two independent checks, not one implying
+# the other.
+has_secondary_marker      <- useSecondaryMarker && has_col(combined_Df, "Intensity_IntegratedIntensity_P2A_SecondaryMarker")
+has_secondary_marker_area <- useSecondaryMarker && has_col(combined_Df, "AreaShape_Area_P2A_SecondaryMarker")
 has_cyto_gfp      <- has_col(combined_Df, "IntegratedIntensity_CytoplasmGFP")        # whole-cell GFP integrated intensity
 has_cyto_foci     <- has_col(combined_Df, "CytoFoci")                                # cytoplasmic foci count
 has_cyto_foci_int <- has_col(combined_Df, "Total_CytoFoci_IntegratedIntensity")
@@ -786,7 +809,7 @@ has_nucfoci_int   <- has_col(combined_Df, "Avg_NucFoci_IntegratedIntensity")
 if (!("Children_GFP_foci_Count" %in% names(combined_Df)))
   stop("No nuclear-foci count column (NucFoci / Children_GFP_foci_Count) found -- this is the core readout.")
 
-message("Channels detected -> tdTomato(int): ", has_td_int,
+message("Channels detected -> secondary marker(int): ", has_secondary_marker,
         " | whole-cell GFP: ", has_cyto_gfp,
         " | cyto foci: ", has_cyto_foci,
         " | nuc-foci morphology: ", has_nucfoci_area || has_nucfoci_compact || has_nucfoci_int)
@@ -844,8 +867,8 @@ combined_Df <- combined_Df %>%
     FormFactor = mean(AreaShape_FormFactor, na.rm = TRUE),
     Avg_Foci      = mean(mean_Nuc_Foci, na.rm = TRUE),
 
-    tdTomato_Area = if (has_td_area) mean(AreaShape_Area_P2A_tdTomato, na.rm = TRUE) else NA_real_,
-    tdTomato      = if (has_td_int)  mean(Intensity_IntegratedIntensity_P2A_tdTomato, na.rm = TRUE) else NA_real_,
+    SecondaryMarker_Area = if (has_secondary_marker_area) mean(AreaShape_Area_P2A_SecondaryMarker, na.rm = TRUE) else NA_real_,
+    SecondaryMarker      = if (has_secondary_marker)  mean(Intensity_IntegratedIntensity_P2A_SecondaryMarker, na.rm = TRUE) else NA_real_,
 
     # NEW per-condition metrics (materialized as NA when the channel is absent so
     # downstream select()/across()/diff calls never break) ----------------------
@@ -869,8 +892,8 @@ pos_Ctrl_DF <- combined_Df %>%
     mean_Pos_Foci = mean(Avg_Foci, na.rm=TRUE),
     cv_Pos        = cv(Avg_Foci) * 100,
 
-    tdTomato_Pos_Area      = if (has_td_area) mean(tdTomato_Area, na.rm=TRUE) else NA_real_,
-    Nuclear_Pos_TdTomato   = if (has_td_int)  mean(tdTomato, na.rm=TRUE)      else NA_real_,
+    SecondaryMarker_Pos_Area      = if (has_secondary_marker_area) mean(SecondaryMarker_Area, na.rm=TRUE) else NA_real_,
+    Nuclear_Pos_SecondaryMarker   = if (has_secondary_marker)  mean(SecondaryMarker, na.rm=TRUE)      else NA_real_,
     .groups = "drop"
   )
 
@@ -883,8 +906,8 @@ neg_Ctrl_DF <- combined_Df %>%
     mean_Neg_Foci = mean(Avg_Foci, na.rm = TRUE),
     cv_Neg        = cv(Avg_Foci) * 100,
 
-    tdTomato_Neg_Area    = if (has_td_area) mean(tdTomato_Area, na.rm = TRUE) else NA_real_,
-    Nuclear_Neg_TdTomato = if (has_td_int)  mean(tdTomato, na.rm = TRUE)      else NA_real_,
+    SecondaryMarker_Neg_Area    = if (has_secondary_marker_area) mean(SecondaryMarker_Area, na.rm = TRUE) else NA_real_,
+    Nuclear_Neg_SecondaryMarker = if (has_secondary_marker)  mean(SecondaryMarker, na.rm = TRUE)      else NA_real_,
 
     .groups = "drop"
   )
@@ -917,12 +940,12 @@ plate_Summary$SB_Plate <- SB_Plate$SB_Plate
 
 p_ctrls <- combined_Df %>% filter( Condition == pos_Ctrl) %>%
   group_by(plate_Num) %>%
-     summarise(Control = paste0(pos_Ctrl), across(c( Nuclei_Number, Avg_Foci, tdTomato), mean, na.rm = TRUE), Condition = pos_Ctrl)
+     summarise(Control = paste0(pos_Ctrl), across(c( Nuclei_Number, Avg_Foci, SecondaryMarker), mean, na.rm = TRUE), Condition = pos_Ctrl)
 
 
 n_ctrls <- combined_Df %>% filter( Condition == neg_Ctrl) %>% 
   group_by(plate_Num) %>%
-     summarise(Control = paste0(neg_Ctrl), across(c(Nuclei_Number, Avg_Foci, tdTomato), mean, na.rm = TRUE), Condition = neg_Ctrl)
+     summarise(Control = paste0(neg_Ctrl), across(c(Nuclei_Number, Avg_Foci, SecondaryMarker), mean, na.rm = TRUE), Condition = neg_Ctrl)
 
 #Export controls summary:
 ctrls <- rbind(p_ctrls, n_ctrls)
@@ -965,7 +988,7 @@ combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")
     # Calculate normalized differences for nuclear area, form factor, and cell count
     NuclearAreaDiff = (Nuclear_Area - mean(Nuclear_Area)) / mean(Nuclear_Area) * 100,
     FormFactorDiff = (FormFactor - mean(FormFactor)) / mean(FormFactor) * 100,
-    tdTomato_Diff = if (has_td_int) (tdTomato - mean(tdTomato)) / mean(tdTomato) * 100 else NA_real_,
+    SecondaryMarker_Diff = if (has_secondary_marker) (SecondaryMarker - mean(SecondaryMarker)) / mean(SecondaryMarker) * 100 else NA_real_,
     CellCountDiff = (Nuclei_Number - mean(Nuclei_Number)) / mean(Nuclei_Number) * 100,
 
     # NEW: per-condition CHANGE (% vs plate mean) in nuclear-foci morphology
@@ -974,9 +997,9 @@ combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")
     NucFoci_IntegratedIntensity_Diff = if (has_nucfoci_int)  (NucFoci_IntegratedIntensity - mean(NucFoci_IntegratedIntensity, na.rm = TRUE)) / mean(NucFoci_IntegratedIntensity, na.rm = TRUE) * 100 else NA_real_
     )
 
-# FAILSAFE: if tdTomato was absent, drop the all-NA diff column so the optional
-# tdTomato residual analysis below (gated on column presence) is cleanly skipped.
-if (!has_td_int) temp_stats_Df$tdTomato_Diff <- NULL
+# FAILSAFE: if secondary marker was absent, drop the all-NA diff column so the optional
+# secondary marker residual analysis below (gated on column presence) is cleanly skipped.
+if (!has_secondary_marker) temp_stats_Df$SecondaryMarker_Diff <- NULL
 
 #Remove any duplicated columns up till now 
 
@@ -1006,7 +1029,7 @@ temp_stats_Df[order(temp_stats_Df$PercentEffect, decreasing = TRUE),]
 colnames(temp_stats_Df)
 ```
 
-<!-- tdTomato quadrant + residual-rescue analysis relocated to the NORMALIZED SCORE PLOT section below. -->
+<!-- secondary marker quadrant + residual-rescue analysis relocated to the NORMALIZED SCORE PLOT section below. -->
 
 ```{r}
 # B-SCORE CALCULATION (CONTROLS FOR POSITIONAL EFFECTS) 
@@ -1086,9 +1109,9 @@ BScore_func <- function(df, rows, cols,
 }
 
 # ---- RUN B-SCORE ONLY WHEN:
-# (1) assayType == "OFF" AND (2) plateSize >= 96
+# (1) useBZ (GUI score type is BZ-score) AND (2) plateSize >= 96
 # Should not use BZ-Score if plate size is smaller than 96 wells
-if (assayType == "OFF" && plateSize >= 96) {
+if (useBZ && plateSize >= 96) {
 
 bs_res <- temp_stats_Df %>%
   filter(Condition == Well_Num) %>%
@@ -1113,7 +1136,7 @@ bs_res <- temp_stats_Df %>%
   temp_stats_Df$BScore  <- NA_real_
   temp_stats_Df$BZScore <- NA_real_
 
-  if (assayType == "OFF" && plateSize < 96) {
+  if (useBZ && plateSize < 96) {
     message("Skipping B-score: plate size < 96 wells (medpolish is unstable with too few wells).")
   }
 }
@@ -1174,18 +1197,18 @@ for (plate in seq_len(length(unique(combined_Df$plate_Num)))){
     
   plots <- list(nuc_plate, cell_plate)
 
-if (has_td_int && "tdTomato" %in% names(sub_df) && any(!is.na(sub_df$tdTomato))) {
-  tdTomato_plate <- plate_plot(
+if (has_secondary_marker && "SecondaryMarker" %in% names(sub_df) && any(!is.na(sub_df$SecondaryMarker))) {
+  SecondaryMarker_plate <- plate_plot(
     data = sub_df,
     position = Well_Num,
-    value = tdTomato,
+    value = SecondaryMarker,
     plate_size = plateSize,
-    title = paste(plate_List[plate], ", Avg. TdTomato Intensity/Condition:", sep = ""),
+    title = paste(plate_List[plate], ", Avg. SecondaryMarker Intensity/Condition:", sep = ""),
     title_size = 14,
     label_size = 1.6,
     colour = c("#FF0000", "#006600", "#006600", "#00CC00", "#00FF00")
   )
-  plots <- c(plots, list(tdTomato_plate))
+  plots <- c(plots, list(SecondaryMarker_plate))
 }
 
 combined_plot <- do.call(grid.arrange, c(plots, ncol = 1))
@@ -1209,10 +1232,10 @@ drop_all_na_cols <- function(df, cols) {
   dplyr::select(df, -dplyr::any_of(cols_drop))
 }
 
-# ---- CONTROLS (optional tdTomato) ----
+# ---- CONTROLS (optional secondary marker) ----
 ctrl_cols <- c("Nuclei_Number", "Avg_Foci")
-if (has_td_area) ctrl_cols <- c(ctrl_cols, "tdTomato_Area")
-if (has_td_int)  ctrl_cols <- c(ctrl_cols, "tdTomato")
+if (has_secondary_marker_area) ctrl_cols <- c(ctrl_cols, "SecondaryMarker_Area")
+if (has_secondary_marker)  ctrl_cols <- c(ctrl_cols, "SecondaryMarker")
 
 p_ctrls <- combined_Df %>%
   filter(Condition == pos_Ctrl) %>%
@@ -1241,8 +1264,8 @@ ctrls <- bind_rows(p_ctrls, n_ctrls) %>%
     AvgFoci   = Avg_Foci
   )
 
-if ("tdTomato_Area" %in% names(ctrls)) ctrls <- ctrls %>% rename(TdTomato_Area = tdTomato_Area)
-if ("tdTomato"      %in% names(ctrls)) ctrls <- ctrls %>% rename(TdTomatoIntensity = tdTomato)
+if ("SecondaryMarker_Area" %in% names(ctrls)) ctrls <- ctrls %>% rename(SecondaryMarker_Area = SecondaryMarker_Area)
+if ("SecondaryMarker"      %in% names(ctrls)) ctrls <- ctrls %>% rename(SecondaryMarkerIntensity = SecondaryMarker)
 
 # ---- PLATE SUMMARY: round + rename (robust) + optional drops ----
 plate_Summary <- plate_Summary %>%
@@ -1252,40 +1275,42 @@ plate_Summary <- plate_Summary %>%
     STDPosCtrl            = any_of("mean_Pos_SD"),
     AvgFociPosCtrl        = any_of("mean_Pos_Foci"),
     CVPosCtrl             = any_of("cv_Pos"),
-    Pos_TdTomatoArea      = any_of("tdTomato_Pos_Area"),
-    Pos_TdTomatoIntensity = any_of("Nuclear_Pos_TdTomato"),
+    Pos_SecondaryMarkerArea      = any_of("SecondaryMarker_Pos_Area"),
+    Pos_SecondaryMarkerIntensity = any_of("Nuclear_Pos_SecondaryMarker"),
     STDNegCtrl            = any_of("mean_Neg_SD"),
     AvgFociNegCtrl        = any_of("mean_Neg_Foci"),
     CVNegCtrl             = any_of("cv_Neg"),
-    Neg_TdTomatoArea      = any_of("tdTomato_Neg_Area"),
-    Neg_TdTomatoIntensity = any_of("Nuclear_Neg_TdTomato"),
+    Neg_SecondaryMarkerArea      = any_of("SecondaryMarker_Neg_Area"),
+    Neg_SecondaryMarkerIntensity = any_of("Nuclear_Neg_SecondaryMarker"),
     PlateZScore           = any_of("ZPrime_Score"),
     SB                    = any_of("SB_Plate")
   )
 
 # Your prior behavior: always remove area cols
-plate_Summary <- plate_Summary %>% select(-any_of(c("Pos_TdTomatoArea", "Neg_TdTomatoArea")))
+plate_Summary <- plate_Summary %>% select(-any_of(c("Pos_SecondaryMarkerArea", "Neg_SecondaryMarkerArea")))
 
 # If intensity wasn't present, remove those too
-if (!has_td_int) {
-  plate_Summary <- plate_Summary %>% select(-any_of(c("Pos_TdTomatoIntensity", "Neg_TdTomatoIntensity")))
+if (!has_secondary_marker) {
+  plate_Summary <- plate_Summary %>% select(-any_of(c("Pos_SecondaryMarkerIntensity", "Neg_SecondaryMarkerIntensity")))
 }
 
-# ---- FINAL RANKED OUTPUT (optional tdTomato) ----
+# ---- FINAL RANKED OUTPUT (optional secondary marker) ----
 combined_Df_out <- temp_stats_Df %>% filter(Condition == Well_Num)
 
-base_off <- c("BZScore", "Viability", "plate_Num", "Well_Num", "ZPrime_Score",
-              "PercentEffect", "Avg_Foci", "CellCountDiff", "Nuclei_Number",
-              "ZScore", "BScore", "AssayType")
+# ---- FINAL RANKED OUTPUT (optional secondary marker) ----
+combined_Df_out <- temp_stats_Df %>% filter(Condition == Well_Num)
 
-base_on  <- c("ZScore", "Viability", "plate_Num", "Well_Num", "ZPrime_Score",
+# Both score columns (Z and BZ) always exist by this point (BZScore is NA when
+# useBZ is FALSE -- see B-score gating above); base_cols keeps both plus
+# whichever one score_col points to is what's actually used for arranging/hits.
+base_cols <- c("BZScore", "ZScore", "Viability", "plate_Num", "Well_Num", "ZPrime_Score",
               "PercentEffect", "Avg_Foci", "CellCountDiff", "Nuclei_Number",
-              "AssayType")
+              "BScore", "AssayType")
 
-td_cols <- character(0)
-if (has_td_area) td_cols <- c(td_cols, "tdTomato_Area")
-if (has_td_int)  td_cols <- c(td_cols, "tdTomato", "tdTomato_Diff")
-if ("residual" %in% names(temp_stats_Df)) td_cols <- c(td_cols, "residual")
+secondary_marker_cols <- character(0)
+if (has_secondary_marker_area) secondary_marker_cols <- c(secondary_marker_cols, "SecondaryMarker_Area")
+if (has_secondary_marker)  secondary_marker_cols <- c(secondary_marker_cols, "SecondaryMarker", "SecondaryMarker_Diff")
+if ("residual" %in% names(temp_stats_Df)) secondary_marker_cols <- c(secondary_marker_cols, "residual")
 
 # NEW optional readouts to carry into the Combined Analysis export. They are kept
 # only if present (intersect with names below) and dropped later if entirely NA:
@@ -1296,69 +1321,37 @@ new_metric_cols <- c("WholeCell_GFP_IntegratedIntensity",
                      "NucFoci_Area_Diff", "NucFoci_Compactness_Diff", "NucFoci_IntegratedIntensity_Diff",
                      "CytoFoci_Count")
 
-if (assayType == "OFF") {
-  keep_cols <- intersect(c(base_off, td_cols, new_metric_cols), names(combined_Df_out))
+keep_cols <- intersect(c(base_cols, secondary_marker_cols, new_metric_cols), names(combined_Df_out))
 
-  combined_Df_out <- combined_Df_out %>%
-    select(all_of(keep_cols)) %>%
-    rename(
-      Plate                = any_of("plate_Num"),
-      Well                 = any_of("Well_Num"),
-      PlateZPrimeScore     = any_of("ZPrime_Score"),
-      PercentEffect        = any_of("PercentEffect"),
-      AvgFoci              = any_of("Avg_Foci"),
-      CellCountPercentDiff = any_of("CellCountDiff"),
-      CellCount            = any_of("Nuclei_Number")
-    ) %>%
-    arrange(desc(BZScore)) %>%
-    mutate(across(where(is.numeric), ~ round(.x, 2)))
+combined_Df_out <- combined_Df_out %>%
+  select(all_of(keep_cols)) %>%
+  rename(
+    Plate                = any_of("plate_Num"),
+    Well                 = any_of("Well_Num"),
+    PlateZPrimeScore     = any_of("ZPrime_Score"),
+    PercentEffect        = any_of("PercentEffect"),
+    AvgFoci              = any_of("Avg_Foci"),
+    CellCountPercentDiff = any_of("CellCountDiff"),
+    CellCount            = any_of("Nuclei_Number")
+  ) %>%
+  arrange(desc(.data[[score_col]])) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
 
-} else {
-  keep_cols <- intersect(c(base_on, td_cols, new_metric_cols), names(combined_Df_out))
-
-  combined_Df_out <- combined_Df_out %>%
-    select(all_of(keep_cols)) %>%
-    rename(
-      Plate                = any_of("plate_Num"),
-      Well                 = any_of("Well_Num"),
-      PlateZPrimeScore     = any_of("ZPrime_Score"),
-      PercentEffect        = any_of("PercentEffect"),
-      AvgFoci              = any_of("Avg_Foci"),
-      CellCountPercentDiff = any_of("CellCountDiff"),
-      CellCount            = any_of("Nuclei_Number")
-    ) %>%
-    arrange(desc(ZScore)) %>%
-    mutate(across(where(is.numeric), ~ round(.x, 2)))
-}
-
-
-
-#Reorder:
-if (assayType == "OFF") {
-combined_Df_out <- combined_Df_out %>% arrange(desc(BZScore))
- } else {
-combined_Df_out <- combined_Df_out %>% arrange(desc(ZScore))
- }  
-
-if (assayType == "OFF"){
-  hits_df <- combined_Df_out %>% filter(BZScore >= 3)
-} else {
-  hits_df <- combined_Df_out %>% filter(ZScore >= 3)
-}
+hits_df <- combined_Df_out %>% filter(.data[[score_col]] >= 3)
 
     
 
-# ---- DROP tdTomato columns if they are entirely NA ----
-td_cols_all <- c(
-  "tdTomato_Area", "tdTomato", "tdTomato_Diff",
-  "TdTomato_Area", "TdTomatoIntensity",
-  "Pos_TdTomatoArea", "Neg_TdTomatoArea",
-  "Pos_TdTomatoIntensity", "Neg_TdTomatoIntensity", "residual"
+# ---- DROP secondary marker columns if they are entirely NA ----
+secondary_marker_cols_all <- c(
+  "SecondaryMarker_Area", "SecondaryMarker", "SecondaryMarker_Diff",
+  "SecondaryMarker_Area", "SecondaryMarkerIntensity",
+  "Pos_SecondaryMarkerArea", "Neg_SecondaryMarkerArea",
+  "Pos_SecondaryMarkerIntensity", "Neg_SecondaryMarkerIntensity", "residual"
 )
 
-combined_Df_out <- drop_all_na_cols(combined_Df_out, c(td_cols_all, new_metric_cols))
-ctrls           <- drop_all_na_cols(ctrls, td_cols_all)
-plate_Summary   <- drop_all_na_cols(plate_Summary, td_cols_all)
+combined_Df_out <- drop_all_na_cols(combined_Df_out, c(secondary_marker_cols_all, new_metric_cols))
+ctrls           <- drop_all_na_cols(ctrls, secondary_marker_cols_all)
+plate_Summary   <- drop_all_na_cols(plate_Summary, secondary_marker_cols_all)
 
 # ---- EXPORT ----
 export_File <- file.path(file_Location, "CondenScreenV2.xlsx")
@@ -1397,8 +1390,8 @@ options(scipen = 999)
 # ============================================================================
  
 # ------------- DATA LOADING AND PREPARATION -------------
-# Load workbook from predefined location (assuming save_Location is defined elsewhere)
-file_Location <- "/home/userX/pathsource/"
+# Load workbook from predefined location (project_data_dir, defined earlier)
+file_Location <- project_data_dir
 export_File <- paste0(file_Location, "CondenScreenV2_temp.xlsx" )  
 save_Location <- file_Location
  image_Save_Location <- save_Location
@@ -1470,11 +1463,7 @@ sheet_df = "Combined Analysis"
 merged_df <- merged_df[!is.na(merged_df$Reference), ]  # Keep only rows with reference names (compounds, genes, etc.)
  
 # 1) Build hits_df2 (hits + QC columns)
-hits_df <- if (assayType == "OFF") {
-  merged_df %>% filter(BZScore >= 3)
-} else {
-  merged_df %>% filter(ZScore >= 3)
-}
+hits_df <- merged_df %>% filter(.data[[score_col]] >= 3)
  
 # (optional) make factors safe for Excel
 hits_df <- hits_df %>% mutate(across(where(is.factor), as.character))
@@ -1507,23 +1496,29 @@ saveWorkbook(wb, export_File, overwrite = TRUE)
 ```{r}
  #NORMALIZED SCORE PLOT:
  
-# == tdTomato QUADRANT + RESIDUAL RESCUE (relocated here from mid-pipeline) =====
-# Runs only when tdTomato data exist. Operates on the final reloaded `merged_df`
-# (which carries PercentEffect, tdTomato_Diff, Plate, Well), saves the quadrant
+# == secondary marker QUADRANT + RESIDUAL RESCUE (relocated here from mid-pipeline) =====
+# Runs only when secondary marker data exist. Operates on the final reloaded `merged_df`
+# (which carries PercentEffect, SecondaryMarker_Diff, Plate, Well), saves the quadrant
 # and residual-rescue figures next to the normalized-score plot, and adds:
 #   - `residual`        : numeric, non-NA only for residual-rescued wells
 #   - `residual_rescue` : TRUE/FALSE flag written to the Excel sheet
  
 # Fallback for restarted sessions where `merged_df` was reloaded directly from
-# CondenScreenV2.xlsx and the earlier `has_td_int <- has_col(...)` step never ran.
-# Treat tdTomato as present if `tdTomato_Diff` exists in merged_df AND is actually
-# populated (not all-NA, which is how the earlier pipeline marks "no tdTomato channel").
-if (!exists("has_td_int")) {
-  has_td_int <- "tdTomato_Diff" %in% names(merged_df) &&
-    any(!is.na(merged_df$tdTomato_Diff))
+# CondenScreenV2.xlsx and the earlier `has_secondary_marker <- has_col(...)` step never ran.
+# Treat secondary marker as present if the GUI toggle was ON (when that's known)
+# AND `SecondaryMarker_Diff` exists in merged_df and is actually populated (not
+# all-NA, which is how the earlier pipeline marks "no secondary marker channel").
+if (!exists("has_secondary_marker")) {
+  .secondary_marker_data_present <- "SecondaryMarker_Diff" %in% names(merged_df) &&
+    any(!is.na(merged_df$SecondaryMarker_Diff))
+  has_secondary_marker <- if (exists("useSecondaryMarker")) {
+    useSecondaryMarker && .secondary_marker_data_present
+  } else {
+    .secondary_marker_data_present
+  }
 }
  
-if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
+if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
  
   out_dir <- paste0(save_Location, "residuals/")
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
@@ -1532,19 +1527,19 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
   merged_df <- merged_df %>% dplyr::select(-dplyr::any_of(c("residual", "residual_rescue")))
  
   # --- Classify wells ---
-  # TotalPercentTdTomato: tdTomato signal expressed as % of the plate mean
-  # (tdTomato_Diff is already the % difference from the plate mean, so 100 + diff).
+  # TotalPercentSecondaryMarker: secondary marker signal expressed as % of the plate mean
+  # (SecondaryMarker_Diff is already the % difference from the plate mean, so 100 + diff).
   #
   # Hit-class boundary is driven by Z/BZ-score > 3 (not PercentEffect). A well
   # can be PercentEffect >= 40 and still be gray/red/yellow if its Z/BZ-score
   # doesn't clear 3 -- PercentEffect is shown on the y-axis but no longer used
   # for the color classification.
-  score_col_hc <- if ("BZScore" %in% names(merged_df) && any(!is.na(merged_df$BZScore))) "BZScore" else "ZScore"
+  score_col_hc <- if (exists("score_col")) score_col else if ("BZScore" %in% names(merged_df) && any(!is.na(merged_df$BZScore))) "BZScore" else "ZScore"
  
-  tdTomato_Df <- merged_df %>%
+  secondary_marker_Df <- merged_df %>%
     mutate(
-      TotalPercentTdTomato = 100 + tdTomato_Diff,
-      tdTomato_outlier = TotalPercentTdTomato > 150,
+      TotalPercentSecondaryMarker = 100 + SecondaryMarker_Diff,
+      secondary_marker_outlier = TotalPercentSecondaryMarker > 150,
       score_value_hc = .data[[score_col_hc]],
  
       hit_class = case_when(
@@ -1553,16 +1548,16 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
         # points relative to the plate mean, i.e. Viability < -50.
         Viability < -50 ~ "Low viability / toxic",
  
-        tdTomato_outlier ~ "tdTomato outlier",
+        secondary_marker_outlier ~ "secondary marker outlier",
  
-        score_value_hc > 3 & Viability >= -50 & TotalPercentTdTomato >= 75 ~
+        score_value_hc > 3 & Viability >= -50 & TotalPercentSecondaryMarker >= 75 ~
           "Confirmed hit",
  
-        score_value_hc > 3 & Viability >= -50 & TotalPercentTdTomato < 75 ~
+        score_value_hc > 3 & Viability >= -50 & TotalPercentSecondaryMarker < 75 ~
           "Suspect — co-suppressed",
  
-        score_value_hc <= 3 & TotalPercentTdTomato < 75 ~
-          "tdTomato suppressed only",
+        score_value_hc <= 3 & TotalPercentSecondaryMarker < 75 ~
+          "secondary marker suppressed only",
  
         TRUE ~ "Inactive"
       ),
@@ -1573,9 +1568,9 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
           "Confirmed hit",
           "Low viability / toxic",
           "Suspect — co-suppressed",
-          "tdTomato suppressed only",
+          "secondary marker suppressed only",
           "Inactive",
-          "tdTomato outlier"
+          "secondary marker outlier"
         )
       )
     )
@@ -1585,24 +1580,24 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
     "Confirmed hit"            = "steelblue",
     "Low viability / toxic"    = "black",
     "Suspect — co-suppressed"  = "tomato",
-    "tdTomato suppressed only" = "goldenrod",
+    "secondary marker suppressed only" = "goldenrod",
     "Inactive"                 = "gray70",
-    "tdTomato outlier"         = "darkgreen"
+    "secondary marker outlier"         = "darkgreen"
   )
  
   # --- Plot limits ---
-  y_max <- max(tdTomato_Df$PercentEffect, na.rm = TRUE)
-  y_min <- min(tdTomato_Df$PercentEffect, na.rm = TRUE)
-  x_min <- min(tdTomato_Df$TotalPercentTdTomato, na.rm = TRUE)
-  x_max <- max(tdTomato_Df$TotalPercentTdTomato, na.rm = TRUE)
+  y_max <- max(secondary_marker_Df$PercentEffect, na.rm = TRUE)
+  y_min <- min(secondary_marker_Df$PercentEffect, na.rm = TRUE)
+  x_min <- min(secondary_marker_Df$TotalPercentSecondaryMarker, na.rm = TRUE)
+  x_max <- max(secondary_marker_Df$TotalPercentSecondaryMarker, na.rm = TRUE)
  
   # --- Suspect wells for residual model ---
-  suspects <- tdTomato_Df %>% filter(hit_class == "Suspect — co-suppressed")
+  suspects <- secondary_marker_Df %>% filter(hit_class == "Suspect — co-suppressed")
  
   if (nrow(suspects) >= 3) {
  
     # --- Residual model ---
-    suspect_model <- lm(PercentEffect ~ TotalPercentTdTomato, data = suspects)
+    suspect_model <- lm(PercentEffect ~ TotalPercentSecondaryMarker, data = suspects)
     model_summary <- summary(suspect_model)
  
     suspects <- suspects %>%
@@ -1616,7 +1611,7 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
     # --- Save model summary ---
     sink(file.path(out_dir, "suspect_model_summary.txt"))
     cat("=== Suspect Cluster Regression Model ===\n\n")
-    cat("Formula: PercentEffect ~ TotalPercentTdTomato\n")
+    cat("Formula: PercentEffect ~ TotalPercentSecondaryMarker\n")
     cat("Subset: hit_class == 'Suspect — co-suppressed'\n\n")
     print(model_summary)
     cat("\n=== Model Performance ===\n")
@@ -1634,7 +1629,7 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
       filter(residual_hit) %>%
       select(Plate, Well)
  
-    tdTomato_Df <- tdTomato_Df %>%
+    secondary_marker_Df <- secondary_marker_Df %>%
       left_join(
         rescued_ids %>% mutate(residual_rescued = TRUE),
         by = c("Plate", "Well")
@@ -1651,7 +1646,7 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
         residual_hit  = FALSE
       )
  
-    tdTomato_Df <- tdTomato_Df %>% mutate(residual_rescued = FALSE)
+    secondary_marker_Df <- secondary_marker_Df %>% mutate(residual_rescued = FALSE)
  
     message("Too few suspects (", nrow(suspects), ") for residual model -- skipping residual rescue.")
   }
@@ -1659,7 +1654,7 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
   # --- hit_class_final: folds in residual-rescue + low-viability override ---
   # (computed once, regardless of which branch above ran, so p1 only needs
   # to be built a single time below)
-  tdTomato_Df <- tdTomato_Df %>%
+  secondary_marker_Df <- secondary_marker_Df %>%
     mutate(
       hit_class_final = case_when(
         Viability < -50 ~ "Low viability / toxic",
@@ -1673,9 +1668,9 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
           "Residual-rescued",
           "Low viability / toxic",
           "Suspect — co-suppressed",
-          "tdTomato suppressed only",
+          "secondary marker suppressed only",
           "Inactive",
-          "tdTomato outlier"
+          "secondary marker outlier"
         )
       )
     )
@@ -1685,32 +1680,32 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
     "Residual-rescued"         = "steelblue",
     "Low viability / toxic"    = "black",
     "Suspect — co-suppressed"  = "tomato",
-    "tdTomato suppressed only" = "goldenrod",
+    "secondary marker suppressed only" = "goldenrod",
     "Inactive"                 = "gray70",
-    "tdTomato outlier"         = "darkgreen"
+    "secondary marker outlier"         = "darkgreen"
   )
  
   # --- P1: quadrant plot (built once; viable residual-rescued labeled in blue) ---
   p1 <- ggplot(
-    tdTomato_Df,
-    aes(x = TotalPercentTdTomato, y = PercentEffect, color = hit_class_final)
+    secondary_marker_Df,
+    aes(x = TotalPercentSecondaryMarker, y = PercentEffect, color = hit_class_final)
   ) +
     # --- Points, layered so gray "Inactive" wells fade into the background ---
     # --- and the blue confirmed/rescued hits stand out clearly.            ---
     geom_point(
-      data = tdTomato_Df %>% filter(hit_class_final == "Inactive"),
+      data = secondary_marker_Df %>% filter(hit_class_final == "Inactive"),
       alpha = 0.25, size = 0.8
     ) +
     geom_point(
-      data = tdTomato_Df %>% filter(!hit_class_final %in% c("Inactive", "Confirmed hit", "Residual-rescued")),
+      data = secondary_marker_Df %>% filter(!hit_class_final %in% c("Inactive", "Confirmed hit", "Residual-rescued")),
       alpha = 0.6, size = 1.5
     ) +
     geom_point(
-      data = tdTomato_Df %>% filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")),
+      data = secondary_marker_Df %>% filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")),
       alpha = 0.9, size = 2.2
     ) +
     geom_text_repel(
-      data = tdTomato_Df %>%
+      data = secondary_marker_Df %>%
         filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued"), PercentEffect > 33.3),
       aes(label = Reference),
       size = 3,
@@ -1719,14 +1714,14 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
       point.padding = 0.2,
       show.legend = FALSE
     ) +
-    # Also label any well with a strong effect (>75%) that isn't tdTomato-suppressed
-    # (red "Suspect" or yellow "tdTomato suppressed only"), even if it didn't clear
-    # the tdTomato/viability bars for "Confirmed hit"
+    # Also label any well with a strong effect (>75%) that isn't secondary marker-suppressed
+    # (red "Suspect" or yellow "secondary marker suppressed only"), even if it didn't clear
+    # the secondary marker/viability bars for "Confirmed hit"
     geom_text_repel(
       
-      data = tdTomato_Df %>%
+      data = secondary_marker_Df %>%
         filter(PercentEffect > 75,
-           !hit_class_final %in% c("Suspect — co-suppressed", "tdTomato suppressed only", "Low viability / toxic")),
+           !hit_class_final %in% c("Suspect — co-suppressed", "secondary marker suppressed only", "Low viability / toxic")),
       
        
       aes(label = Reference),
@@ -1752,12 +1747,12 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
       label = "Suspect / co-suppressed", color = "tomato", size = 3, hjust = 0
     ) +
     labs(
-      x = "tdTomato % of plate mean",
+      x = "secondary marker % of plate mean",
       y = "MLF2-GFP % Effect",
       color = "Hit class",
-      title = "Quadrant: PercentEffect vs. tdTomato",
+      title = "Quadrant: PercentEffect vs. secondary marker",
       subtitle = paste0(
-        "Blue = viable confirmed/residual-rescued hits (", score_col_hc, " > 3, tdTomato >= 75% or residual-rescued, Viability >= -50); ",
+        "Blue = viable confirmed/residual-rescued hits (", score_col_hc, " > 3, secondary marker >= 75% or residual-rescued, Viability >= -50); ",
         "black = Viability < -50. PercentEffect (y-axis) does not affect color."
       )
     ) +
@@ -1772,9 +1767,9 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
   if (nrow(suspects) >= 3) {
  
     # --- P2: residual rescue plot ---
-    p2 <- ggplot(suspects, aes(x = TotalPercentTdTomato, y = PercentEffect)) +
+    p2 <- ggplot(suspects, aes(x = TotalPercentSecondaryMarker, y = PercentEffect)) +
       geom_segment(
-        aes(xend = TotalPercentTdTomato, yend = fitted),
+        aes(xend = TotalPercentSecondaryMarker, yend = fitted),
         color = "gray60", alpha = 0.4, linewidth = 0.4
       ) +
       geom_point(aes(color = residual_hit), size = 2.5, alpha = 0.8) +
@@ -1791,7 +1786,7 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
       scale_color_manual(values = c("FALSE" = "tomato", "TRUE" = "steelblue"),
                          labels = c("FALSE" = "Suspect", "TRUE" = "Residual-rescued")) +
       labs(
-        x        = "tdTomato % of plate mean",
+        x        = "secondary marker % of plate mean",
         y        = "MLF2-GFP % Effect",
         color    = NULL,
         title    = "Residual rescue within viable suspect cluster",
@@ -1815,8 +1810,8 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
     ggsave(file.path(out_dir, "p1_percenteffect_quadrant.png"), p1, width = 10, height = 7, dpi = 300)
     ggsave(file.path(out_dir, "p2_residual_rescue.png"), p2,       width = 10, height = 7,  dpi = 300)
     ggsave(file.path(out_dir, "residual_plots.png"),     combined, width = 10, height = 14, dpi = 300)
-    ggsave(paste0(image_Save_Location, "tdTomato_quadrant.pdf"), p1, width = 10, height = 7, dpi = 300)
-    ggsave(paste0(image_Save_Location, "tdTomato_residual_rescue.pdf"), p2, width = 10, height = 7, dpi = 300)
+    ggsave(paste0(image_Save_Location, "SecondaryMarker_quadrant.pdf"), p1, width = 10, height = 7, dpi = 300)
+    ggsave(paste0(image_Save_Location, "SecondaryMarker_residual_rescue.pdf"), p2, width = 10, height = 7, dpi = 300)
  
     # --- bring `residual` back onto merged_df for viable RESCUED wells only ---
     merged_df <- merged_df %>%
@@ -1830,7 +1825,7 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
     })
  
     ggsave(file.path(out_dir, "p1_percenteffect_quadrant.png"), p1, width = 10, height = 7, dpi = 300)
-    ggsave(paste0(image_Save_Location, "tdTomato_quadrant.pdf"), p1, width = 10, height = 7, dpi = 300)
+    ggsave(paste0(image_Save_Location, "SecondaryMarker_quadrant.pdf"), p1, width = 10, height = 7, dpi = 300)
  
     merged_df$residual <- NA_real_
   }
@@ -1842,11 +1837,11 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
   wb_res <- createWorkbook()
  
   addWorksheet(wb_res, "All Wells")
-  writeData(wb_res, "All Wells", tdTomato_Df %>% arrange(desc(PercentEffect)))
+  writeData(wb_res, "All Wells", secondary_marker_Df %>% arrange(desc(PercentEffect)))
  
   addWorksheet(wb_res, "Confirmed Hits")
   writeData(wb_res, "Confirmed Hits",
-            tdTomato_Df %>%
+            secondary_marker_Df %>%
               filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")) %>%
               filter(Viability >= -50) %>%
               arrange(desc(PercentEffect)))
@@ -1860,26 +1855,26 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df)) {
  
   addWorksheet(wb_res, "Export Hits")
   writeData(wb_res, "Export Hits",
-            tdTomato_Df %>%
+            secondary_marker_Df %>%
               filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")) %>%
               filter(Viability >= -50) %>%
               arrange(desc(PercentEffect)))
  
   addWorksheet(wb_res, "Low Viability Toxic")
   writeData(wb_res, "Low Viability Toxic",
-            tdTomato_Df %>% filter(Viability < -50) %>% arrange(desc(PercentEffect)))
+            secondary_marker_Df %>% filter(Viability < -50) %>% arrange(desc(PercentEffect)))
  
   saveWorkbook(wb_res, file.path(out_dir, "residual_analysis.xlsx"), overwrite = TRUE)
  
-  cat("tdTomato quadrant/residual analysis complete. Aux outputs in:", out_dir, "\n")
+  cat("secondary marker quadrant/residual analysis complete. Aux outputs in:", out_dir, "\n")
  
   # --- Re-write Combined Analysis + Hits with residual + residual_rescue ---
   if (exists("export_File") && file.exists(export_File)) {
     wb_x <- loadWorkbook(export_File)
     md_x <- merged_df %>%
       mutate(across(where(is.factor), as.character)) %>%
-      arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
-    hd_x <- if (assayType == "OFF") filter(md_x, BZScore >= 3) else filter(md_x, ZScore >= 3)
+      arrange(desc(.data[[score_col]]))
+    hd_x <- filter(md_x, .data[[score_col]] >= 3)
     for (s in c("Combined Analysis", "Hits")) if (s %in% names(wb_x)) removeWorksheet(wb_x, s)
     addWorksheet(wb_x, "Combined Analysis"); writeData(wb_x, "Combined Analysis", md_x)
     freezePane(wb_x, "Combined Analysis", firstActiveRow = 2)
@@ -1897,17 +1892,17 @@ merged_df <- merged_df %>%
   mutate(
     score_value = .data[[score_col]],
     bz_hit  = score_value >= 3,
-    td_ok   = if (has_td_int && "tdTomato_Diff" %in% names(.)) {
-                # passes if tdTomato drop is acceptable OR was flagged by residual method.
+    secondary_marker_ok   = if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(.)) {
+                # passes if secondary marker drop is acceptable OR was flagged by residual method.
                 # `residual` only exists when the residual-rescue step produced hits, so
                 # guard on its presence (otherwise it's all-NA and gets dropped on export).
                 if ("residual" %in% names(.)) {
-                  (tdTomato_Diff >= -25) | (!is.na(residual))
+                  (SecondaryMarker_Diff >= -25) | (!is.na(residual))
                 } else {
-                  tdTomato_Diff >= -25
+                  SecondaryMarker_Diff >= -25
                 }
               } else {
-                TRUE  # no tdTomato data or not applicable — don't penalize
+                TRUE  # no secondary marker data or not applicable — don't penalize
               },
     viab_ok = if ("Viability" %in% names(.))
                 Viability >= -25
@@ -1915,10 +1910,10 @@ merged_df <- merged_df %>%
   ) %>%
   select(-score_value)
  
-# --- Export Hits sheet: BZ/Z >= 3 AND passes viability AND (tdTomato OK or residual-rescued) ---
+# --- Export Hits sheet: BZ/Z >= 3 AND passes viability AND (secondary marker OK or residual-rescued) ---
 if (exists("export_File") && file.exists(export_File)) {
   export_hits_df <- merged_df %>%
-    filter(bz_hit, viab_ok, td_ok) %>%
+    filter(bz_hit, viab_ok, secondary_marker_ok) %>%
     mutate(across(where(is.factor), as.character)) %>%
     arrange(desc(.data[[score_col]]))
  
@@ -1930,22 +1925,23 @@ if (exists("export_File") && file.exists(export_File)) {
   addFilter(wb_eh, "Export Hits", rows = 1, cols = 1:ncol(export_hits_df))
   saveWorkbook(wb_eh, export_File, overwrite = TRUE)
  
-  cat("Export Hits sheet written:", nrow(export_hits_df), "hits passing BZ/Z >= 3, viability, and tdTomato/residual-rescue criteria\n")
+  cat("Export Hits sheet written:", nrow(export_hits_df), "hits passing BZ/Z >= 3, viability, and secondary marker/residual-rescue criteria\n")
 }
  
- plot_normalized_score <- function(df, assay_type, image_path, has_td_int = TRUE) {
-  score_col <- if (assay_type == "OFF") "BZScore" else "ZScore"   # keep as string; symbol can't index df[[ ]]
-  label_y   <- if (assay_type == "OFF") "BZ-Score" else "Z-Score"
+ plot_normalized_score <- function(df, image_path, has_secondary_marker = TRUE) {
+  # score_col/label_y come from the GUI's score-type toggle (scoreType/useBZ,
+  # set once near the top of the pipeline) -- independent of signal ON/OFF.
+  label_y   <- if (useBZ) "BZ-Score" else "Z-Score"
   y_limits  <- c(min(merged_df[[score_col]], na.rm = TRUE), max(merged_df[[score_col]], na.rm = TRUE))
   y_breaks  <- c(-4, -2, 0, 2, 4, 6, 8)
  
   hits_df <- dplyr::filter(df, .data[[score_col]] >= 3)
   bg_df   <- dplyr::filter(df, .data[[score_col]] < 3)
  
-  if (has_td_int) {
-    hits_df <- hits_df %>% mutate(pass = as.character(td_ok & viab_ok))
+  if (has_secondary_marker) {
+    hits_df <- hits_df %>% mutate(pass = as.character(secondary_marker_ok & viab_ok))
   } else {
-    # No tdTomato channel: td_ok defaults to TRUE (set above), but viability
+    # No secondary marker channel: secondary_marker_ok defaults to TRUE (set above), but viability
     # still matters, so a hit only passes if it clears the viability bar.
     hits_df <- hits_df %>% mutate(pass = as.character(viab_ok))
   }
@@ -1983,7 +1979,7 @@ if (exists("export_File") && file.exists(export_File)) {
     guides(color = "none", size = "none")
  
   ggsave(
-    filename = paste0(image_path, "normalized_SigScoreTdTomatoScreen.pdf"),
+    filename = paste0(image_path, "normalized_SigScoreSecondaryMarkerScreen.pdf"),
     plot     = p,
     dpi      = 300,
     width    = 8,
@@ -1992,7 +1988,7 @@ if (exists("export_File") && file.exists(export_File)) {
  
   return(p)
 }
-plot_normalized_score(merged_df, assayType, image_Save_Location, has_td_int = has_td_int) 
+plot_normalized_score(merged_df, image_Save_Location, has_secondary_marker = has_secondary_marker) 
  
  
 merged_df
@@ -2120,24 +2116,24 @@ if ("NucFoci_IntegratedIntensity" %in% names(merged_df) && any(!is.na(merged_df$
   message("Skipping nuclear-foci integrated-intensity distribution: column absent or all-NA.")
 }
  
-# (3) tdTomato normalized effect distribution (only if a tdTomato channel exists)
-if (has_td_int && "tdTomato_Diff" %in% names(merged_df) && any(!is.na(merged_df$tdTomato_Diff))) {
-  td_dist_df <- merged_df %>%
-    filter(!is.na(tdTomato_Diff)) %>%
-    mutate(TotalPercentTdTomato = 100 + tdTomato_Diff)
+# (3) secondary marker normalized effect distribution (only if a secondary marker channel exists)
+if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df) && any(!is.na(merged_df$SecondaryMarker_Diff))) {
+  secondary_marker_dist_df <- merged_df %>%
+    filter(!is.na(SecondaryMarker_Diff)) %>%
+    mutate(TotalPercentSecondaryMarker = 100 + SecondaryMarker_Diff)
  
-  tdTomato_dist <- ggplot(td_dist_df, aes(x = TotalPercentTdTomato)) +
+  SecondaryMarker_dist <- ggplot(secondary_marker_dist_df, aes(x = TotalPercentSecondaryMarker)) +
     geom_histogram(color = "black", fill = "darkgray", binwidth = 4) +
     geom_density(alpha = 0.6, fill = "darkgray") +
     geom_vline(aes(xintercept = 100), linetype = "dashed", linewidth = 2.5) +
-    labs(title = NULL, y = "Count (conditions)", x = "tdTomato % of plate mean") +
+    labs(title = NULL, y = "Count (conditions)", x = "secondary marker % of plate mean") +
     .distr_theme
  
-  ggsave(paste(image_Save_Location, "TdTomato_NormalizedEffect_distribution.pdf", sep = ""),
-         tdTomato_dist, dpi = 300, width = 10, height = 10)
-  print(tdTomato_dist)
+  ggsave(paste(image_Save_Location, "SecondaryMarker_NormalizedEffect_distribution.pdf", sep = ""),
+         SecondaryMarker_dist, dpi = 300, width = 10, height = 10)
+  print(SecondaryMarker_dist)
 } else {
-  message("Skipping tdTomato normalized-effect distribution: no tdTomato channel.")
+  message("Skipping secondary marker normalized-effect distribution: no secondary marker channel.")
 }
   
    
@@ -2156,9 +2152,9 @@ if (has_td_int && "tdTomato_Diff" %in% names(merged_df) && any(!is.na(merged_df$
 # 1. CONFIGURATION
 # ============================================================
 #If not previously defined:
-#fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
+#fileX   <- paste0(project_data_dir, "CondenScreenV2.xlsx")
  
-file_Location    <- "/nfs/roberts/scratch/pi_cs723/djp94/YCMD/UseChemicalDiversityAll/"
+file_Location    <- project_data_dir
 fileX            <- paste0(file_Location, "CondenScreenV2.xlsx")
 sheetX           <- "Combined Analysis"
 out_dir          <- paste0(file_Location, "HTS_QC_OUT/")
@@ -2507,7 +2503,7 @@ if (!activated) {
 reticulate::py_config()                       # confirm interpreter
 Chem <- reticulate::import("rdkit.Chem")
 #Path to previously exported datasheet.
-save_Location <- "/nfs/roberts/scratch/pi_cs723/djp94/YCMD/UseChemicalDiversityAll/"
+save_Location <- project_data_dir
  
 #Saves cached smiles, if available, to avoid re-querying PubChem/CACTUS
 CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
@@ -2525,11 +2521,7 @@ wb <- loadWorkbook(fileX)  # must load before referencing names(wb)
  
 if (!sheet_hits %in% names(wb)) {
   # Build hits_df and write new sheet
-  hits_df <- if (assayType == "OFF") {
-    read.xlsx(fileX, sheet = "Combined Analysis") %>% filter(BZScore >= 3)
-  } else {
-    read.xlsx(fileX, sheet = "Combined Analysis") %>% filter(ZScore >= 3)
-  }
+  hits_df <- read.xlsx(fileX, sheet = "Combined Analysis") %>% filter(.data[[score_col]] >= 3)
   addWorksheet(wb, sheet_hits)
   writeData(wb, sheet_hits, hits_df)
   saveWorkbook(wb, fileX, overwrite = TRUE)
@@ -3031,7 +3023,7 @@ properties_tbl <- dplyr::bind_rows(properties_list)
 #
 #   Score 5 (MODERATE):
 #     - Industry structural alerts (MLSMR / NIH structural alerts, BMS, GSK, Glaxo, LINT, Dundee)
-#     - tdTomato reporter suppression (≥25% loss)
+#     - secondary marker reporter suppression (≥25% loss)
 #
 #   Score 2 (MINOR):
 #     - Lipinski rule-of-five violations
@@ -3050,8 +3042,8 @@ df_final <- df_hits %>%
   select(-ends_with(".old")) %>%
   mutate(
     Viability = if ("Viability" %in% names(.)) Viability else NA_real_,
-    TdTomato = if ("tdTomato_Diff" %in% names(.)) {
-    tdTomato_Diff <= -25 &
+    SecondaryMarker = if ("SecondaryMarker_Diff" %in% names(.)) {
+    SecondaryMarker_Diff <= -25 &
       if ("residual" %in% names(.)) is.na(residual) else TRUE
   } else FALSE,
     
@@ -3064,7 +3056,7 @@ df_final <- df_hits %>%
     # --- Flag categories ---
     High_Flag = grepl("PAINS", flags, ignore.case = TRUE) | Cytotoxic,
  
-    Moderate_Flag = grepl("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE) | TdTomato,
+    Moderate_Flag = grepl("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE) | SecondaryMarker,
  
     Mild_Flag = grepl("INPHARMATICA|SURECHEMBL", flags, ignore.case = TRUE) |
                 (!is.na(Lipinski_Failed) & Lipinski_Failed > 0),
@@ -3107,7 +3099,7 @@ df_final <- df_final %>%
     "BZScore", "ZScore", "BScore", "PercentEffect",
     "Viability", "Risk", "PlateZPrimeScore", "Systematic_error", "QC_alpha",
     "AvgFoci", "Average_foci_perCell", "CellCount", "CellCountPercentDiff",
-    "AssayType", "TdTomato", "residual", "Cytotoxic",
+    "AssayType", "SecondaryMarker", "residual", "Cytotoxic",
     "CAS", "SMILES_used", "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
     "AlertScore", "alert_flags"
   )))
@@ -3169,20 +3161,23 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
  
 # ── Restrict Tanimoto/cheminformatics analysis to confirmed hits ────────────────
 # Only compounds with BZ/Z-Score > 3 that pass viability (Viability >= -50) and,
-# if a tdTomato channel exists, pass the tdTomato filter. This mirrors the
-# viab_ok / td_ok conventions used elsewhere (TdTomato here is the "failed"
-# drop flag, so passing == !TdTomato).
-score_col_chem <- if ("BZScore" %in% names(df_final)) "BZScore" else "ZScore"
+# if a secondary marker channel exists, pass the secondary marker filter. This mirrors the
+# viab_ok / secondary_marker_ok conventions used elsewhere (SecondaryMarker here is the "failed"
+# drop flag, so passing == !SecondaryMarker).
+# Reuses the GUI-derived score_col when this chunk is run in the same session as
+# the rest of the pipeline; falls back to data-presence detection for a
+# standalone restart where only df_final was reloaded from disk.
+score_col_chem <- if (exists("score_col")) score_col else if ("BZScore" %in% names(df_final)) "BZScore" else "ZScore"
  
 df_chem <- df_final %>%
   filter(
     .data[[score_col_chem]] > 3,
     is.na(Viability) | Viability >= -50,
-    if (has_td_int && "TdTomato" %in% names(.)) (is.na(TdTomato) | !TdTomato) else TRUE
+    if (has_secondary_marker && "SecondaryMarker" %in% names(.)) (is.na(SecondaryMarker) | !SecondaryMarker) else TRUE
   )
  
 message("Cheminformatics: ", nrow(df_chem), " of ", nrow(df_final),
-        " hits pass BZ/Z>3, viability, and tdTomato filters.")
+        " hits pass BZ/Z>3, viability, and secondary marker filters.")
  
 # ── Molecular Fingerprinting ───────────────────────────────────────────────────────────────
 fps <- lapply(df_chem$SMILES_used, function(smi) {
@@ -3212,7 +3207,7 @@ umap_colors <- c("NT Ctrl" = "#F4A8B0", "RNF26" = "#F5C89A", "ZNF335" = "#C8B8E0
 make_legend <- function(ref, hits_df) {
   row <- hits_df %>% filter(Reference == ref)
   paste0(ref, " | Effect:", sprintf("%.1f", row$PercentEffect),
-         " | td:", sprintf("%.1f", row$tdTomato_Diff))
+         " | td:", sprintf("%.1f", row$SecondaryMarker_Diff))
 }
 strip_name <- function(mol) { mol$SetProp("_Name", ""); mol }
  
@@ -3487,7 +3482,7 @@ if (length(groups_unique) == 0) {
       row <- df_merged %>% filter(Reference == ref) %>% slice(1)
  
       eff_val <- if ("PercentEffect" %in% names(row)) row$PercentEffect[1] else NA_real_
-      td_val  <- if ("tdTomato_Diff" %in% names(row)) row$tdTomato_Diff[1] else NA_real_
+      secondary_marker_val  <- if ("SecondaryMarker_Diff" %in% names(row)) row$SecondaryMarker_Diff[1] else NA_real_
  
       others    <- setdiff(seq_len(n_in_grp), i)
       tan_lines <- sapply(others, function(j) {
@@ -3497,7 +3492,7 @@ if (length(groups_unique) == 0) {
  
       lines <- c(
         ref,
-        sprintf("Eff: %.1f  |  td: %.1f", eff_val, td_val),
+        sprintf("Eff: %.1f  |  td: %.1f", eff_val, secondary_marker_val),
         strrep("-", 20),
         "Tanimoto:",
         tan_lines
@@ -3594,7 +3589,7 @@ freezePane(wb, "UMAP Results", firstRow = TRUE, firstCol = FALSE)
 #     column applies for this run).
 addWorksheet(wb, "Clusters")
 cluster_export <- cluster_all_df %>%
-  left_join(df_merged %>% select(any_of(c("Reference", "PercentEffect", "tdTomato_Diff"))), by = "Reference") %>%
+  left_join(df_merged %>% select(any_of(c("Reference", "PercentEffect", "SecondaryMarker_Diff"))), by = "Reference") %>%
   left_join(df_chem %>% select(Reference, Score = all_of(score_col_chem)), by = "Reference") %>%
   group_by(Group) %>%
   mutate(Hit = Score > 3) %>%
@@ -3607,8 +3602,8 @@ n_cluster_rows  <- nrow(cluster_export)
 n_cluster_cols  <- ncol(cluster_export)
 cluster_colnames <- names(cluster_export)
  
-# Numeric columns vary depending on whether tdTomato_Diff exists for this run
-numeric_cols <- match(intersect(c("PercentEffect", "tdTomato_Diff", "Score"), cluster_colnames),
+# Numeric columns vary depending on whether SecondaryMarker_Diff exists for this run
+numeric_cols <- match(intersect(c("PercentEffect", "SecondaryMarker_Diff", "Score"), cluster_colnames),
                        cluster_colnames)
  
 addStyle(wb, "Clusters", style = cell_style_text,
@@ -3686,7 +3681,7 @@ if (exists("export_hits_df") && exists("fileX") && file.exists(fileX)) {
       mutate(across(where(is.factor), as.character)) %>%
       select(any_of(c("Plate", "Well", "Risk", "AlertScore", "alert_flags",
                        "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
-                       "CAS", "SMILES_used", "TdTomato", "Cytotoxic"))) %>%
+                       "CAS", "SMILES_used", "SecondaryMarker", "Cytotoxic"))) %>%
       distinct(Plate, Well, .keep_all = TRUE)
   } else {
     tibble::tibble(Plate = character(), Well = character())
