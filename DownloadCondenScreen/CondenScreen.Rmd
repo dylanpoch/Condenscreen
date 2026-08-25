@@ -80,6 +80,16 @@ ui <- fluidPage(
       # Existing: signal toggle
       actionButton("signal_toggle", "Signal: OFF", style = "width: 100%"),
 
+      # NEW: Z-score vs BZ-score toggle
+      actionButton("score_type_toggle", "Score: Z-score", style = "width: 100%"),
+
+      # NEW: normalization reference toggle (only meaningful if Negative Control wells exist)
+      actionButton("score_ref_toggle", "Normalize vs: Negative Control", style = "width: 100%"),
+
+      # NEW: secondary marker toggle -- expression readout independent of hit-calling
+      actionButton("secondary_marker_toggle", "Secondary Marker: OFF", style = "width: 100%"),
+      helpText("Secondary marker quantifies expression via integrated intensity per well, separate from the hit-calling signal above."),
+
       actionButton("clear", "Clear Selections"),
       hr(),
 
@@ -176,12 +186,52 @@ server <- function(input, output, session) {
     updateActionButton(session, "screen_toggle", label = paste0("Screen: ", screen_type()))
   })
 
-  # Signal toggle
+  # Signal toggle -- kept independent of score type below. This just records
+  # whether the reporter signal is on or off for this run; it does NOT imply
+  # which score (Z vs BZ) gets used downstream.
   signal_status <- reactiveVal(FALSE)
   observeEvent(input$signal_toggle, {
     signal_status(!signal_status())
     updateActionButton(session, "signal_toggle",
                        label = ifelse(signal_status(), "Signal: ON", "Signal: OFF"))
+  })
+
+  # Z-score vs BZ-score toggle.
+  # Z-score = (x - mean) / sd (parametric, sensitive to outliers/edge effects).
+  # BZ-score = (x - median) / (MAD * 1.4826) (robust, standard for HTS/HCS since
+  # it's insensitive to hit-driven skew within a plate/reference set). This flag
+  # is just recorded as metadata here; the actual per-well score computation
+  # happens downstream (in the *_results.csv analysis step), so we pass the
+  # choice along rather than compute it in this selection app. Set independently
+  # from the Signal toggle -- there is no assumed pairing between the two.
+  score_type <- reactiveVal("Z-score")
+  observeEvent(input$score_type_toggle, {
+    score_type(ifelse(score_type() == "Z-score", "BZ-score", "Z-score"))
+    updateActionButton(session, "score_type_toggle", label = paste0("Score: ", score_type()))
+  })
+
+  # Normalization reference toggle.
+  # "Negative Control" -> center/scale (mean/sd or median/MAD) computed only from
+  # wells annotated as Negative Control on this plate.
+  # "Plate-wide" -> center/scale computed from all wells on the plate (useful when
+  # a plate has no/sparse negative controls, or for genetic screens where every
+  # well is a distinct perturbation and there's no dedicated control set).
+  score_reference <- reactiveVal("Negative Control")
+  observeEvent(input$score_ref_toggle, {
+    score_reference(ifelse(score_reference() == "Negative Control", "Plate-wide", "Negative Control"))
+    updateActionButton(session, "score_ref_toggle", label = paste0("Normalize vs: ", score_reference()))
+  })
+
+  # Secondary marker toggle -- flags whether a second channel/stain should be
+  # quantified as integrated intensity per well (e.g. an expression reporter
+  # or counterstain), independent of the primary hit-calling signal/score
+  # settings above. Recorded as metadata only; the actual intensity
+  # integration happens downstream in the image-analysis/quantification step.
+  secondary_marker_status <- reactiveVal(FALSE)
+  observeEvent(input$secondary_marker_toggle, {
+    secondary_marker_status(!secondary_marker_status())
+    updateActionButton(session, "secondary_marker_toggle",
+                       label = ifelse(secondary_marker_status(), "Secondary Marker: ON", "Secondary Marker: OFF"))
   })
 
   # Map UI condition to internal label
@@ -257,7 +307,7 @@ server <- function(input, output, session) {
       ))
   })
 
-  # Download: includes plate dims + screen type
+  # Download: includes plate dims + screen type + score settings + secondary marker
   output$download <- downloadHandler(
     filename = function() input$save_filename,
     content = function(file) {
@@ -272,6 +322,17 @@ server <- function(input, output, session) {
 
       dims <- plate_dims()
 
+      # Guardrail: if the user picked "Negative Control" as the normalization
+      # reference but never actually annotated any wells that way, flag it in
+      # the metadata so the downstream analysis script can fall back to
+      # plate-wide (or error loudly) instead of silently dividing by NA/zero.
+      has_neg_control <- any(well_data()$Condition == "Negative Control")
+      score_reference_effective <- if (score_reference() == "Negative Control" && !has_neg_control) {
+        "Plate-wide (no Negative Control wells selected)"
+      } else {
+        score_reference()
+      }
+
       settings_df <- data.frame(
         PlateType = input$plate_type,         # e.g. "16x24"
         PlateRows = dims$rows,
@@ -279,9 +340,12 @@ server <- function(input, output, session) {
         PlateWells = dims$rows * dims$cols,
 
         ScreenType = screen_type(),           # "Chemical" / "Genetic"
+        ScoreType = score_type(),             # "Z-score" / "BZ-score"
+        ScoreReference = score_reference_effective,  # "Negative Control" / "Plate-wide"
         SaveDirectory = save_dir(),           # metadata
         InputDirectory = input_dir(),         # metadata
         SignalStatus = ifelse(signal_status(), "ON", "OFF"),
+        SecondaryMarkerStatus = ifelse(secondary_marker_status(), "ON", "OFF"),
         PositiveControlName = input$pos_control_name,
         NegativeControlName = input$neg_control_name,
         stringsAsFactors = FALSE
