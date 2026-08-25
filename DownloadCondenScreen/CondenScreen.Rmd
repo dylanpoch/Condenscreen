@@ -1886,8 +1886,6 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
   }
 }
  
-score_col <- if ("BZScore" %in% names(merged_df)) "BZScore" else "ZScore"
- 
 merged_df <- merged_df %>%
   mutate(
     score_value = .data[[score_col]],
@@ -3042,7 +3040,10 @@ df_final <- df_hits %>%
   select(-ends_with(".old")) %>%
   mutate(
     Viability = if ("Viability" %in% names(.)) Viability else NA_real_,
-    SecondaryMarker = if ("SecondaryMarker_Diff" %in% names(.)) {
+    # NOTE: named SecondaryMarkerFlag (not SecondaryMarker) -- df_hits may still
+    # carry the raw mean-intensity SecondaryMarker column from earlier in the
+    # pipeline, and this boolean must not silently overwrite it.
+    SecondaryMarkerFlag = if ("SecondaryMarker_Diff" %in% names(.)) {
     SecondaryMarker_Diff <= -25 &
       if ("residual" %in% names(.)) is.na(residual) else TRUE
   } else FALSE,
@@ -3056,7 +3057,7 @@ df_final <- df_hits %>%
     # --- Flag categories ---
     High_Flag = grepl("PAINS", flags, ignore.case = TRUE) | Cytotoxic,
  
-    Moderate_Flag = grepl("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE) | SecondaryMarker,
+    Moderate_Flag = grepl("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE) | SecondaryMarkerFlag,
  
     Mild_Flag = grepl("INPHARMATICA|SURECHEMBL", flags, ignore.case = TRUE) |
                 (!is.na(Lipinski_Failed) & Lipinski_Failed > 0),
@@ -3099,7 +3100,7 @@ df_final <- df_final %>%
     "BZScore", "ZScore", "BScore", "PercentEffect",
     "Viability", "Risk", "PlateZPrimeScore", "Systematic_error", "QC_alpha",
     "AvgFoci", "Average_foci_perCell", "CellCount", "CellCountPercentDiff",
-    "AssayType", "SecondaryMarker", "residual", "Cytotoxic",
+    "AssayType", "SecondaryMarkerFlag", "residual", "Cytotoxic",
     "CAS", "SMILES_used", "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
     "AlertScore", "alert_flags"
   )))
@@ -3162,8 +3163,8 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 # ── Restrict Tanimoto/cheminformatics analysis to confirmed hits ────────────────
 # Only compounds with BZ/Z-Score > 3 that pass viability (Viability >= -50) and,
 # if a secondary marker channel exists, pass the secondary marker filter. This mirrors the
-# viab_ok / secondary_marker_ok conventions used elsewhere (SecondaryMarker here is the "failed"
-# drop flag, so passing == !SecondaryMarker).
+# viab_ok / secondary_marker_ok conventions used elsewhere (SecondaryMarkerFlag here is the
+# "failed" drop flag, so passing == !SecondaryMarkerFlag).
 # Reuses the GUI-derived score_col when this chunk is run in the same session as
 # the rest of the pipeline; falls back to data-presence detection for a
 # standalone restart where only df_final was reloaded from disk.
@@ -3173,7 +3174,7 @@ df_chem <- df_final %>%
   filter(
     .data[[score_col_chem]] > 3,
     is.na(Viability) | Viability >= -50,
-    if (has_secondary_marker && "SecondaryMarker" %in% names(.)) (is.na(SecondaryMarker) | !SecondaryMarker) else TRUE
+    if (has_secondary_marker && "SecondaryMarkerFlag" %in% names(.)) (is.na(SecondaryMarkerFlag) | !SecondaryMarkerFlag) else TRUE
   )
  
 message("Cheminformatics: ", nrow(df_chem), " of ", nrow(df_final),
@@ -3681,7 +3682,7 @@ if (exists("export_hits_df") && exists("fileX") && file.exists(fileX)) {
       mutate(across(where(is.factor), as.character)) %>%
       select(any_of(c("Plate", "Well", "Risk", "AlertScore", "alert_flags",
                        "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
-                       "CAS", "SMILES_used", "SecondaryMarker", "Cytotoxic"))) %>%
+                       "CAS", "SMILES_used", "SecondaryMarkerFlag", "Cytotoxic"))) %>%
       distinct(Plate, Well, .keep_all = TRUE)
   } else {
     tibble::tibble(Plate = character(), Well = character())
