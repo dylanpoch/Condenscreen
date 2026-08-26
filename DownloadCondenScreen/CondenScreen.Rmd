@@ -455,7 +455,6 @@ process_batch <- function(batch_row, file_Location) {
       df_GFP[, NucFoci  := NA_integer_]
       df_GFP[, CytoFoci := NA_integer_]
     }
-    
     # Which per-focus measurement columns are actually present (failsafe if a
     # CellProfiler export is missing one). Booleans are captured by the data.table
     # j-expression below; the unused if-branch is never evaluated, so a missing
@@ -619,13 +618,7 @@ cat("Combined:", nrow(combined_data), "rows across", length(batch_files), "batch
 combined_data
 ```
 
-```{r}
-# cat("Class:", class(manifest), "\n")
-# cat("Columns:", names(manifest), "\n")
-# print(head(manifest, 10))
- 
-colnames(combined_data)
-```
+
 
 ```{r}
 # STRING EXTRACTION FOR WELL/PLATE NAMING CONVENTIONS 
@@ -709,9 +702,6 @@ combined_data$plate_Num <- ifelse(combined_data$plate_Num %in% names(dp_map),
 
 combined_Df <- combined_data
  
-
-unique(combined_Df$plate_Num)
-colnames(combined_Df)
 
 
 ```
@@ -1247,9 +1237,6 @@ if (!has_secondary_marker) {
 # ---- FINAL RANKED OUTPUT (optional secondary marker) ----
 combined_Df_out <- temp_stats_Df %>% filter(Condition == Well_Num)
 
-# ---- FINAL RANKED OUTPUT (optional secondary marker) ----
-combined_Df_out <- temp_stats_Df %>% filter(Condition == Well_Num)
-
 # Both score columns (Z and BZ) always exist by this point (BZScore is NA when
 # useBZ is FALSE -- see B-score gating above); base_cols keeps both plus
 # whichever one score_col points to is what's actually used for arranging/hits.
@@ -1341,7 +1328,6 @@ options(scipen = 999)
  
 # ------------- DATA LOADING AND PREPARATION -------------
 # Load workbook from predefined location (project_data_dir, defined earlier)
-file_Location <- project_data_dir
 export_File <- paste0(file_Location, "CondenScreenV2.xlsx" )  
 save_Location <- file_Location
  image_Save_Location <- save_Location
@@ -1377,8 +1363,8 @@ if (template_exists) {
   smiles_col <- pick_first_existing(template, smiles_candidates)
   
   select_cols <- c(
-    intersect("Plate", colnames(template)),
-    well_col, ref_col, cas_col, smiles_col
+  intersect("Plate", colnames(template)),
+  well_col, ref_col, cas_col, smiles_col
   )
   select_cols <- select_cols[!is.na(select_cols)]
   
@@ -1389,6 +1375,8 @@ if (template_exists) {
       CAS  = any_of(cas_candidates)
     )
   
+ 
+  
   existing_ref <- intersect(ref_candidates, colnames(template))[1]
   if (!is.na(existing_ref)) {
     template <- template %>% rename(Reference = all_of(existing_ref))
@@ -1397,8 +1385,10 @@ if (template_exists) {
   }
   
   merged_df <- merged_df %>% select(-any_of(c("Reference", "Gene", "Compound", "SMILES")))
-  merged_df <- merge(merged_df, template, by = c("Plate", "Well"))
-  
+  #merged_df <- merge(merged_df, template, by = c("Plate", "Well"))
+  #Only if plates done in replicate with same well ID number:
+  merged_df <- merge(merged_df, template, by = c("Well"))
+
 } else {
   message("plateMap.xlsx not found at ", template_location, " — skipping template merge.")
   
@@ -1411,9 +1401,64 @@ if (template_exists) {
 }
 sheet_hits = "Hits"
 sheet_df = "Combined Analysis"
+sheet_reps = "Replicates"
+
 merged_df <- merged_df[!is.na(merged_df$Reference), ]  # Keep only rows with reference names (compounds, genes, etc.)
  
-# 1) Build hits_df2 (hits + QC columns)
+
+# ── REPLICATES (raw, un-averaged) + COLLAPSE TO PER-REFERENCE AVERAGE ────────
+# This screen was run in triplicate: after the Well-only plateMap merge above,
+# each Reference has up to 3 records (one per physical plate). We want:
+#   (a) a "Replicates" sheet listing every individual record, but ONLY for
+#       References that actually have >1 record -- singletons don't belong
+#       there, and if nothing has replicates the sheet isn't created at all.
+#   (b) "Combined Analysis" (and therefore every downstream plot/analysis that
+#       reads merged_df from here on) collapsed to ONE row per Reference, with
+#       every numeric feature averaged across its replicate records.
+
+merged_df_records <- merged_df  # keep the full per-plate/per-well table before collapsing
+
+replicate_counts <- merged_df_records %>% dplyr::count(Reference, name = "nReplicates")
+replicate_refs   <- replicate_counts %>% dplyr::filter(nReplicates > 1) %>% dplyr::pull(Reference)
+has_replicates   <- length(replicate_refs) > 0
+
+if (has_replicates) {
+  replicates_df <- merged_df_records %>%
+    dplyr::filter(Reference %in% replicate_refs) %>%
+    dplyr::left_join(replicate_counts, by = "Reference") %>%
+    dplyr::arrange(Reference, Plate, Well)
+  cat(length(replicate_refs), "References have replicate records --",
+      "'Replicates' sheet will be written.\n")
+} else {
+  cat("No Reference has more than one record -- skipping 'Replicates' sheet.\n")
+}
+
+# Columns to average: every numeric feature EXCEPT Reference itself (in case it
+# were ever coded numerically). Plate/Well legitimately differ per replicate and
+# aren't numeric, so they're preserved as a semicolon-joined list rather than
+# dropped or averaged. Everything else (CAS, SMILES, any other template
+# metadata) is assumed constant per Reference and its first non-NA value is kept.
+numeric_cols  <- setdiff(names(merged_df_records)[sapply(merged_df_records, is.numeric)], "Reference")
+id_like_cols  <- intersect(c("Plate", "Well"), names(merged_df_records))
+constant_cols <- setdiff(names(merged_df_records), c(numeric_cols, id_like_cols, "Reference"))
+
+first_non_na <- function(x) {
+  nn <- x[!is.na(x)]
+  if (length(nn) == 0) NA else nn[1]
+}
+
+merged_df <- merged_df_records %>%
+  dplyr::group_by(Reference) %>%
+  dplyr::summarise(
+    nReplicates = dplyr::n(),
+    dplyr::across(dplyr::all_of(id_like_cols),  ~ paste(unique(.x), collapse = "; ")),
+    dplyr::across(dplyr::all_of(constant_cols), first_non_na),
+    dplyr::across(dplyr::all_of(numeric_cols),  ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  dplyr::select(dplyr::any_of(names(merged_df_records)), nReplicates)  # restore original column order, nReplicates last
+
+# 1) Build hits_df2 (hits + QC columns) -- now evaluated on the averaged score per Reference
 hits_df <- merged_df %>% filter(.data[[score_col]] >= 3)
  
 # (optional) make factors safe for Excel
@@ -1440,6 +1485,16 @@ merged_df2 <- merged_df2 %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore e
 writeData(wb, sheet_df, merged_df2, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_df, firstActiveRow = 2)
 addFilter(wb, sheet_df, rows = 1, cols = 1:ncol(merged_df2))
+
+# ── Replicates sheet: only written if at least one Reference had >1 record ──
+if (has_replicates) {
+  replicates_df_out <- replicates_df %>% mutate(across(where(is.factor), as.character))
+  if (sheet_reps %in% names(wb)) removeWorksheet(wb, sheet_reps)
+  addWorksheet(wb, sheet_reps)
+  writeData(wb, sheet_reps, replicates_df_out, startCol = 1, startRow = 1, colNames = TRUE)
+  freezePane(wb, sheet_reps, firstActiveRow = 2)
+  addFilter(wb, sheet_reps, rows = 1, cols = 1:ncol(replicates_df_out))
+}
  
 saveWorkbook(wb, export_File, overwrite = TRUE)
 ```
@@ -2136,8 +2191,8 @@ if (has_secondary_marker && "SecondaryMarker_Intensity_Diff" %in% names(merged_d
 } else {
   message("Skipping secondary marker normalized-effect distribution: no secondary marker channel.")
 }
-  
-   
+
+
 ```
  
  
@@ -2474,6 +2529,7 @@ invisible(NULL)
 ```
  
  
+
  
 ```{r}
 ###OPTIONAL###
@@ -3077,7 +3133,47 @@ df_final <- df_hits %>%
       AlertScore >= 2    ~ "MINOR",
       TRUE               ~ "CLEAN"
     )
+  ) %>%
+  mutate(
+    # Explicit, human-readable reason for each flag tier. `flags`/`alert_flags`
+    # only ever holds structural-alert names, so a row flagged solely via
+    # SecondaryMarker or Cytotoxic (not a structural alert match) previously
+    # showed an empty/unrelated alert string with no visible explanation.
+    AlertReason = purrr::pmap_chr(
+      list(has_smiles, High_Flag, Cytotoxic, flags, Moderate_Flag, SecondaryMarker, Mild_Flag, Lipinski_Failed),
+      function(has_smiles, High_Flag, Cytotoxic, flags, Moderate_Flag, SecondaryMarker, Mild_Flag, Lipinski_Failed) {
+        if (!has_smiles) return(NA_character_)
+        reasons <- character(0)
+        if (High_Flag) {
+          if (grepl("PAINS", flags, ignore.case = TRUE)) reasons <- c(reasons, "PAINS structural alert")
+          if (Cytotoxic) reasons <- c(reasons, "Cytotoxicity (Viability <= -25%)")
+        }
+        if (Moderate_Flag) {
+          industry_hit <- regmatches(flags, regexpr("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE))
+          if (length(industry_hit) > 0 && nzchar(industry_hit)) reasons <- c(reasons, paste0(industry_hit, " structural alert"))
+          if (isTRUE(SecondaryMarker)) reasons <- c(reasons, "Secondary marker suppression (>=25% drop from plate mean)")
+        }
+        if (Mild_Flag) {
+          if (grepl("INPHARMATICA|SURECHEMBL", flags, ignore.case = TRUE)) reasons <- c(reasons, "Inpharmatica/SureChEMBL structural alert")
+          if (!is.na(Lipinski_Failed) && Lipinski_Failed > 0) reasons <- c(reasons, "Lipinski rule-of-five violation")
+        }
+        if (length(reasons) == 0) return("None")
+        paste(reasons, collapse = "; ")
+      }
+    )
   )
+
+# Confirm/quantify explicitly, rather than leaving it as an assumption: how
+# many MODERATE-risk hits owe that entirely to secondary marker suppression,
+# with no structural alert contributing.
+n_moderate_secondary_only <- df_final %>%
+  filter(Risk == "MODERATE", isTRUE(SecondaryMarker),
+         !grepl("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE)) %>%
+  nrow()
+n_moderate_total <- sum(df_final$Risk == "MODERATE", na.rm = TRUE)
+cat(n_moderate_secondary_only, "of", n_moderate_total,
+    "MODERATE-risk hits are flagged solely due to secondary marker suppression",
+    "(>=25% drop from plate mean), with no structural alert match. See AlertReason.\n")
  
  
 chem_cols_chr <- c("flags", "Lipinski", "Lipinski_Failed")
@@ -3100,9 +3196,9 @@ df_final <- df_final %>%
     "BZScore", "ZScore", "BScore", "PercentEffect",
     "Viability", "Risk", "PlateZPrimeScore", "Systematic_error", "QC_alpha",
     "AvgFoci", "Average_foci_perCell", "CellCount", "CellCountPercentDiff",
-    "AssayType", "SecondaryMarker_Intensity", "residual", "Cytotoxic",
+    "AssayType", "SecondaryMarker_Intensity", "SecondaryMarker_Intensity_Diff", "residual", "Cytotoxic",
     "CAS", "SMILES_used", "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
-    "AlertScore", "alert_flags"
+    "AlertScore", "alert_flags", "AlertReason"
   )))
 # ============================================================
 # 8) Write back to Excel
@@ -3165,16 +3261,39 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 # if a secondary marker channel exists, pass the secondary marker filter. This mirrors the
 # viab_ok / secondary_marker_ok conventions used elsewhere (SecondaryMarker here is the "failed"
 # drop flag, so passing == !SecondaryMarker).
-# Reuses the GUI-derived score_col when this chunk is run in the same session as
-# the rest of the pipeline; falls back to data-presence detection for a
-# standalone restart where only df_final was reloaded from disk.
-score_col_chem <- if (exists("score_col")) score_col else if ("BZScore" %in% names(df_final)) "BZScore" else "ZScore"
+# Resolves against df_final's OWN populated-ness of BZScore/ZScore -- NOT the
+# inherited session-level `score_col`. score_col was resolved against the full
+# merged_df, which can have finite BZScore values overall while the (smaller)
+# hits-only df_final subset is entirely NA for that same column, e.g. when none
+# of the confirmed hits happened to land on the B-score-eligible replicate.
+# Reusing score_col blindly turns `.data[[score_col_chem]] > 3` into NA for
+# every row here, which filter() drops -- silently zeroing out df_chem instead
+# of falling back to ZScore. resolve_score_col() (defined above) checks
+# is.finite(), not just column existence, so apply it to df_final directly.
+score_col_chem <- if ("BZScore" %in% names(df_final) && any(is.finite(df_final$BZScore))) {
+  "BZScore"
+} else if ("ZScore" %in% names(df_final) && any(is.finite(df_final$ZScore))) {
+  "ZScore"
+} else if (exists("score_col")) {
+  score_col  # last resort for a standalone restart where df_final itself has no finite score at all
+} else {
+  stop("Neither BZScore nor ZScore has any finite values in df_final -- ",
+       "check the upstream normalization/averaging step before this block runs.")
+}
  
 df_chem <- df_final %>%
   filter(
     .data[[score_col_chem]] > 3,
     is.na(Viability) | Viability >= -50,
-    if (has_secondary_marker && "SecondaryMarker_Intensity" %in% names(.)) (is.na(SecondaryMarker_Intensity) | !SecondaryMarker_Intensity) else TRUE
+    # Matches the Export Hits convention (secondary_marker_ok): pass if the
+    # secondary marker channel isn't in use, the diff column is missing/NA, or
+    # the drop from plate mean is within 25%. Previously this checked
+    # `!SecondaryMarker_Intensity`, which coerces a continuous intensity value
+    # to logical (TRUE only when exactly 0) -- effectively always FALSE, so it
+    # silently dropped every row regardless of score/viability.
+    if (has_secondary_marker && "SecondaryMarker_Intensity_Diff" %in% names(.)) {
+      is.na(SecondaryMarker_Intensity_Diff) | SecondaryMarker_Intensity_Diff >= -25
+    } else TRUE
   )
  
 message("Cheminformatics: ", nrow(df_chem), " of ", nrow(df_final),
@@ -3274,15 +3393,29 @@ butina_clusters <- Butina$ClusterData(dist_vec, n_chem, cluster_cutoff, isDistDa
 # The first index in each Butina tuple is the cluster centroid (the compound
 # with the most neighbors within the cutoff) -- a natural structural
 # representative for that cluster.
-cluster_all_df <- bind_rows(lapply(seq_along(butina_clusters), function(g) {
-  idx <- unlist(butina_clusters[[g]]) + 1L  # python 0-based -> R 1-based
-  data.frame(
-    Reference      = refs_valid[idx],
-    Group          = g,
-    Representative = c(TRUE, rep(FALSE, length(idx) - 1)),
-    stringsAsFactors = FALSE
-  )
-})) %>% arrange(Group)
+# Guard: with 0 (or 1) valid compounds, butina_clusters is empty and
+# bind_rows(list()) returns a tibble with NO columns at all (not just zero
+# rows) -- arrange(Group) then errors with "object 'Group' not found" because
+# there's nothing to bind. Give cluster_all_df its expected columns explicitly
+# in that case so every chunk downstream that references Reference/Group/
+# Representative keeps working on an empty (but correctly shaped) table.
+if (n_chem == 0) {
+  cat("No compounds passed the cheminformatics filters (df_chem is empty) -- ",
+      "skipping clustering; downstream cluster tables/plots will be empty.\n")
+}
+cluster_all_df <- if (length(butina_clusters) == 0) {
+  tibble::tibble(Reference = character(0), Group = integer(0), Representative = logical(0))
+} else {
+  bind_rows(lapply(seq_along(butina_clusters), function(g) {
+    idx <- unlist(butina_clusters[[g]]) + 1L  # python 0-based -> R 1-based
+    data.frame(
+      Reference      = refs_valid[idx],
+      Group          = g,
+      Representative = c(TRUE, rep(FALSE, length(idx) - 1)),
+      stringsAsFactors = FALSE
+    )
+  })) %>% arrange(Group)
+}
  
 # Multi-compound clusters only, for the IMAGE 5 structure grid
 component_df <- cluster_all_df %>%
@@ -3292,6 +3425,14 @@ cluster_summary <- component_df %>%
   group_by(Group) %>%
   summarize(n = n(), compounds = paste(Reference, collapse = ", "))
  
+# Everything below (heatmap, similarity distribution, MDS/PCoA, UMAP, cluster
+# images, and the final cheminformatics_results.xlsx export) requires at least
+# 2 valid compounds -- a dist object / pheatmap / cmdscale on 0 or 1 points is
+# undefined and throws opaque errors (e.g. `distance[1] == "correlation"` on a
+# zero-length dist evaluates to NA, not FALSE, which crashes the if-check
+# inside pheatmap). Skip the whole image/export block gracefully instead.
+if (n_chem >= 2) {
+
 # ── IMAGE 1: Heatmap ───────────────────────────────────────────────────────────
 #Convert from similarity to distance matrix for heatmap clustering:
 tanimoto_dist <- as.dist(1 - sim_matrix)
@@ -3644,6 +3785,11 @@ message("Export complete:")
 message("  Images: tanimoto_heatmap.png, tanimoto_distribution.png, pca_scatter.png,")
 message("umap_scatter.png, hits_structures.png, hits_structures_grouped.png")
 message("  Excel:  cheminformatics_results.xlsx (3 sheets: Tanimoto Similarity, UMAP Results, Clusters)")
+
+} else {
+  message("Fewer than 2 compounds passed the cheminformatics filters (n_chem = ", n_chem,
+          ") -- skipping heatmap/PCoA/UMAP/cluster image generation and cheminformatics_results.xlsx export.")
+}
 ```
  
 ```{r}
@@ -3680,9 +3826,9 @@ if (exists("export_hits_df") && exists("fileX") && file.exists(fileX)) {
   chem_cols <- if (exists("df_final")) {
     df_final %>%
       mutate(across(where(is.factor), as.character)) %>%
-      select(any_of(c("Plate", "Well", "Risk", "AlertScore", "alert_flags",
+      select(any_of(c("Plate", "Well", "Risk", "AlertScore", "alert_flags", "AlertReason",
                        "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
-                       "CAS", "SMILES_used", "SecondaryMarker_Intensity", "Cytotoxic"))) %>%
+                       "CAS", "SMILES_used", "SecondaryMarker_Intensity", "SecondaryMarker_Intensity_Diff", "Cytotoxic"))) %>%
       distinct(Plate, Well, .keep_all = TRUE)
   } else {
     tibble::tibble(Plate = character(), Well = character())
