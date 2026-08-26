@@ -1366,16 +1366,16 @@ if (template_exists) {
   intersect("Plate", colnames(template)),
   well_col, ref_col, cas_col, smiles_col
   )
-  select_cols <- select_cols[!is.na(select_cols)]
-  
-  template <- template %>%
-    select(all_of(select_cols)) %>%
-    rename(
-      Well = any_of(well_candidates),
-      CAS  = any_of(cas_candidates)
-    )
-  
- 
+  select_cols <- c(well_col, ref_col, cas_col, smiles_col)
+select_cols <- select_cols[!is.na(select_cols)]
+
+template <- template %>%
+  select(all_of(select_cols)) %>%
+  rename(
+    Well = any_of(well_candidates),
+    CAS  = any_of(cas_candidates)
+  ) %>%
+  distinct(Well, .keep_all = TRUE)
   
   existing_ref <- intersect(ref_candidates, colnames(template))[1]
   if (!is.na(existing_ref)) {
@@ -2530,7 +2530,6 @@ invisible(NULL)
  
  
 
- 
 ```{r}
 ###OPTIONAL###
 # ============================================================
@@ -3225,9 +3224,13 @@ writeData(wb, sheet_hits, df_final, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_hits, firstActiveRow = 2)
 addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(df_final))
  
-# Desired sheets (in order)
+# Desired sheets (in order). Replicates is optional -- only present if any
+# Reference actually had >1 record. It was missing from this list entirely,
+# so the pruning loop below silently deleted it (along with anything else not
+# on the list) every time this chunk ran.
 new_order <- c("Hits", "Combined Analysis", "Plate Statistics", "Controls")
- 
+if (sheet_reps %in% names(wb)) new_order <- c(new_order, sheet_reps)
+
 # Remove unwanted sheets
 for (sh in setdiff(names(wb), new_order)) {
   removeWorksheet(wb, sh)
@@ -3241,6 +3244,670 @@ saveWorkbook(wb, fileX, overwrite = TRUE)
  
  
 ```
+  
+```{r}
+# RDKit imports
+rdkit       <- import("rdkit")
+Chem        <- rdkit$Chem
+AllChem     <- rdkit$Chem$AllChem
+DataStructs <- rdkit$DataStructs
+Draw        <- import("rdkit.Chem.Draw")
+MolDrawing  <- import("rdkit.Chem.Draw.rdMolDraw2D")
+ 
+# ── Output directory ───────────────────────────────────────────────────────────
+out_dir <- save_Location
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+ 
+ 
+# ── Restrict Tanimoto/cheminformatics analysis to confirmed hits ────────────────
+# Only compounds with BZ/Z-Score > 3 that pass viability (Viability >= -50) and,
+# if a secondary marker channel exists, pass the secondary marker filter. This mirrors the
+# viab_ok / secondary_marker_ok conventions used elsewhere (SecondaryMarker here is the "failed"
+# drop flag, so passing == !SecondaryMarker).
+# Resolves against df_final's OWN populated-ness of BZScore/ZScore -- NOT the
+# inherited session-level `score_col`. score_col was resolved against the full
+# merged_df, which can have finite BZScore values overall while the (smaller)
+# hits-only df_final subset is entirely NA for that same column, e.g. when none
+# of the confirmed hits happened to land on the B-score-eligible replicate.
+# Reusing score_col blindly turns `.data[[score_col_chem]] > 3` into NA for
+# every row here, which filter() drops -- silently zeroing out df_chem instead
+# of falling back to ZScore. resolve_score_col() (defined above) checks
+# is.finite(), not just column existence, so apply it to df_final directly.
+score_col_chem <- if ("BZScore" %in% names(df_final) && any(is.finite(df_final$BZScore))) {
+  "BZScore"
+} else if ("ZScore" %in% names(df_final) && any(is.finite(df_final$ZScore))) {
+  "ZScore"
+} else if (exists("score_col")) {
+  score_col  # last resort for a standalone restart where df_final itself has no finite score at all
+} else {
+  stop("Neither BZScore nor ZScore has any finite values in df_final -- ",
+       "check the upstream normalization/averaging step before this block runs.")
+}
+ 
+df_chem <- df_final %>%
+  filter(
+    .data[[score_col_chem]] > 3,
+    is.na(Viability) | Viability >= -50,
+    # Matches the Export Hits convention (secondary_marker_ok): pass if the
+    # secondary marker channel isn't in use, the diff column is missing/NA, or
+    # the drop from plate mean is within 25%. Previously this checked
+    # `!SecondaryMarker_Intensity`, which coerces a continuous intensity value
+    # to logical (TRUE only when exactly 0) -- effectively always FALSE, so it
+    # silently dropped every row regardless of score/viability.
+    if (has_secondary_marker && "SecondaryMarker_Intensity_Diff" %in% names(.)) {
+      is.na(SecondaryMarker_Intensity_Diff) | SecondaryMarker_Intensity_Diff >= -25
+    } else TRUE
+  )
+ 
+message("Cheminformatics: ", nrow(df_chem), " of ", nrow(df_final),
+        " hits pass BZ/Z>3, viability, and secondary marker filters.")
+ 
+# ── Molecular Fingerprinting ───────────────────────────────────────────────────────────────
+fps <- lapply(df_chem$SMILES_used, function(smi) {
+  mol <- Chem$MolFromSmiles(smi)
+  if (is.null(mol)) return(NULL)
+  AllChem$GetMorganFingerprintAsBitVect(mol, radius = 2L, nBits = 2048L)
+})
+valid <- !sapply(fps, is.null)
+fps   <- fps[valid]
+refs  <- df_chem$Reference[valid]
+ 
+ 
+# ── Tanimoto similarity matrix ─────────────────────────────────────────────────
+n <- length(fps)
+sim_matrix <- matrix(0, n, n, dimnames = list(refs, refs))
+for (i in seq_len(n))
+  for (j in seq_len(n))
+    sim_matrix[i, j] <- DataStructs$TanimotoSimilarity(fps[[i]], fps[[j]])
+ 
+# ── Palette ────────────────────────────────────────────────────────────────────
+diverging_owp    <- colorRampPalette(c("#E87D3E", "#F5C9A0", "white", "#9B8EC4", "#3B2A6E"))(100)
+sequential_pdark <- colorRampPalette(c("#F5D0D8", "#C98BAA", "#7B3F7A", "#3A1050", "#0F0318"))(100)
+bar_fill         <- "darkgray"
+umap_colors <- c("NT Ctrl" = "#F4A8B0", "RNF26" = "#F5C89A", "ZNF335" = "#C8B8E0")
+ 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+make_legend <- function(ref, hits_df) {
+  row <- hits_df %>% filter(Reference == ref)
+  paste0(ref, " | Effect:", sprintf("%.1f", row$PercentEffect),
+         " | td:", sprintf("%.1f", row$SecondaryMarker_Intensity_Diff))
+}
+strip_name <- function(mol) { mol$SetProp("_Name", ""); mol }
+ 
+opts <- MolDrawing$MolDrawOptions()
+opts$legendFontSize <- 22L
+opts$legendFraction <- 0.15
+opts$padding        <- 0.05
+ 
+# ── Mol objects ────────────────────────────────────────────────────────────────
+mols       <- lapply(df_chem$SMILES_used, function(smi) Chem$MolFromSmiles(smi))
+valid_mol  <- !sapply(mols, is.null)
+mols_valid <- mols[valid_mol]
+refs_valid <- df_chem$Reference[valid_mol]
+ 
+#------------------------
+#Figure Generation:
+#------------------------
+# Turn whatever MolsToGridImage returns into a PNG file on disk
+grid_png_to_file <- function(obj, path) {
+  if (is.raw(obj)) { writeBin(obj, path); return(invisible(path)) }
+  rawc <- tryCatch(reticulate::py_to_r(obj), error = function(e) NULL)
+  if (is.raw(rawc)) { writeBin(rawc, path); return(invisible(path)) }
+  if (inherits(obj, "python.builtin.bytes")) {            # your case: write via Python
+    bi  <- reticulate::import_builtins()
+    con <- bi$open(path, "wb"); con$write(obj); con$close()
+    return(invisible(path))
+  }
+  if (!is.null(tryCatch(obj$save, error = function(e) NULL))) {  # PIL Image fallback
+    obj$save(path); return(invisible(path))
+  }
+  stop("Unrecognized MolsToGridImage return: ", paste(class(obj), collapse = ", "))
+}
+# ── Structural clustering (Butina / Taylor-Butina) ──────────────────────────────
+# Butina clustering greedily picks centroids with the most neighbors within the
+# distance cutoff, giving compact, centroid-based clusters. This is more
+# defensible than a simple similarity-threshold graph (igraph::components),
+# which performs single-linkage clustering and can chain compounds together
+# transitively even when the endpoints aren't very similar to each other.
+# Computed up-front (before the MDS plot) so cluster membership can be used
+# to color the MDS scatter.
+Butina <- import("rdkit.ML.Cluster.Butina")
+ 
+# Tanimoto DISTANCE cutoff (1 - similarity). 0.6 distance == 0.4 similarity,
+# matching the threshold used previously.
+cluster_cutoff <- 0.7
+ 
+n_chem <- length(refs_valid)
+if (n_chem >= 2) {
+  dist_vec <- numeric(n_chem * (n_chem - 1) / 2)
+  k <- 1L
+  for (i in 2:n_chem) {
+    for (j in 1:(i - 1)) {
+      dist_vec[k] <- 1 - sim_matrix[i, j]
+      k <- k + 1L
+    }
+  }
+} else {
+  dist_vec <- numeric(0)
+}
+ 
+butina_clusters <- Butina$ClusterData(dist_vec, n_chem, cluster_cutoff, isDistData = TRUE)
+ 
+# The first index in each Butina tuple is the cluster centroid (the compound
+# with the most neighbors within the cutoff) -- a natural structural
+# representative for that cluster.
+# Guard: with 0 (or 1) valid compounds, butina_clusters is empty and
+# bind_rows(list()) returns a tibble with NO columns at all (not just zero
+# rows) -- arrange(Group) then errors with "object 'Group' not found" because
+# there's nothing to bind. Give cluster_all_df its expected columns explicitly
+# in that case so every chunk downstream that references Reference/Group/
+# Representative keeps working on an empty (but correctly shaped) table.
+if (n_chem == 0) {
+  cat("No compounds passed the cheminformatics filters (df_chem is empty) -- ",
+      "skipping clustering; downstream cluster tables/plots will be empty.\n")
+}
+cluster_all_df <- if (length(butina_clusters) == 0) {
+  tibble::tibble(Reference = character(0), Group = integer(0), Representative = logical(0))
+} else {
+  bind_rows(lapply(seq_along(butina_clusters), function(g) {
+    idx <- unlist(butina_clusters[[g]]) + 1L  # python 0-based -> R 1-based
+    data.frame(
+      Reference      = refs_valid[idx],
+      Group          = g,
+      Representative = c(TRUE, rep(FALSE, length(idx) - 1)),
+      stringsAsFactors = FALSE
+    )
+  })) %>% arrange(Group)
+}
+ 
+# Multi-compound clusters only, for the IMAGE 5 structure grid
+component_df <- cluster_all_df %>%
+  group_by(Group) %>% filter(n() > 1) %>% ungroup() %>% arrange(Group)
+ 
+cluster_summary <- component_df %>%
+  group_by(Group) %>%
+  summarize(n = n(), compounds = paste(Reference, collapse = ", "))
+ 
+# Everything below (heatmap, similarity distribution, MDS/PCoA, UMAP, cluster
+# images, and the final cheminformatics_results.xlsx export) requires at least
+# 2 valid compounds -- a dist object / pheatmap / cmdscale on 0 or 1 points is
+# undefined and throws opaque errors (e.g. `distance[1] == "correlation"` on a
+# zero-length dist evaluates to NA, not FALSE, which crashes the if-check
+# inside pheatmap). Skip the whole image/export block gracefully instead.
+if (n_chem >= 2) {
+
+# ── IMAGE 1: Heatmap ───────────────────────────────────────────────────────────
+#Convert from similarity to distance matrix for heatmap clustering:
+tanimoto_dist <- as.dist(1 - sim_matrix)
+ 
+png(file.path(out_dir, "tanimoto_heatmap.png"), width = 2800, height = 2400, res = 300)
+pheatmap(sim_matrix,                        # still display the similarity values
+         clustering_distance_rows = tanimoto_dist,
+         clustering_distance_cols = tanimoto_dist,
+         clustering_method = "ward.D2",
+         color = diverging_owp,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         fontsize_row = 5,
+         fontsize_col = 5)
+dev.off()
+ 
+# ── IMAGE 2: Similarity distribution ──────────────────────────────────────────
+sim_vals <- melt(sim_matrix) %>% filter(Var1 != Var2)
+p_dist <- ggplot(sim_vals, aes(x = value)) +
+  geom_histogram(bins = 50, fill = bar_fill, color = "white") +
+  geom_vline(xintercept = 0.4, linetype = "dashed", color = "#E87D3E") +
+  labs(title = "Pairwise Tanimoto Similarity Distribution",
+       x = "Tanimoto Similarity", y = "Count") +
+  theme_classic()
+ggsave(file.path(out_dir, "tanimoto_distribution.png"), p_dist, width = 8, height = 5, dpi = 150)
+ 
+# ── IMAGE 3: MDS (PCoA) scatter ─────────────────────────────────────────────────
+# UMAP is unstable/unreliable for small N. Classical MDS (cmdscale) on the
+# Tanimoto distance matrix is deterministic and behaves sensibly at any N.
+# Column names kept as UMAP1/UMAP2/umap_df to avoid disrupting the Excel export.
+dist_matrix <- 1 - sim_matrix
+n_items     <- nrow(dist_matrix)
+ 
+if (n_items >= 3) {
+  mds_res <- cmdscale(as.dist(dist_matrix), k = min(2L, n_items - 1L))
+ 
+  if (ncol(mds_res) < 2) mds_res <- cbind(mds_res, 0)  # guard for k=1 edge case
+ 
+  umap_df <- data.frame(UMAP1 = mds_res[, 1],
+                         UMAP2 = mds_res[, 2],
+                         Reference = rownames(sim_matrix))
+  p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, label = Reference)) +
+    geom_point(color = bar_fill, size = 2) +
+    geom_text_repel(size = 3) +
+    theme_classic() +
+    labs(title = "MDS (PCoA) of Chemical Fingerprint Similarity",
+         x = "MDS1", y = "MDS2")
+  ggsave(file.path(out_dir, "umap_scatter.png"), p_umap, width = 8, height = 6, dpi = 150)
+} else {
+  message("Too few compounds (", n_items, ") for a meaningful MDS plot -- skipping plot.")
+  umap_df <- data.frame(UMAP1 = NA_real_, UMAP2 = NA_real_,
+                        Reference = rownames(sim_matrix))   # keeps the Excel sheet working
+}
+ 
+# ── IMAGE 3b: MDS scatter colored by structural (Butina) cluster ───────────────
+# Same MDS embedding as IMAGE 3, but colored by Butina cluster membership so
+# you can see at a glance which hits are structurally related. Singletons
+# (clusters of size 1) are grouped into a single "Unclustered" category and
+# shown in gray so the discrete color scale isn't dominated by one-off groups.
+if (n_items >= 3 && exists("cluster_all_df")) {
+  cluster_sizes <- cluster_all_df %>% count(Group)
+  multi_groups  <- cluster_sizes$Group[cluster_sizes$n > 1]
+ 
+  umap_cluster_df <- umap_df %>%
+    left_join(cluster_all_df %>% select(Reference, Group), by = "Reference") %>%
+    mutate(
+      ClusterLabel = if_else(Group %in% multi_groups,
+                              paste0("Cluster ", Group),
+                              "Unclustered")
+    )
+ 
+  # Stable color assignment: real clusters get the qualitative palette,
+  # "Unclustered" is always gray regardless of how many clusters exist.
+  named_levels <- sort(unique(umap_cluster_df$ClusterLabel[umap_cluster_df$ClusterLabel != "Unclustered"]))
+  cluster_levels <- c(named_levels, "Unclustered")
+ 
+  cluster_colors <- if (length(named_levels) > 0) scales::hue_pal()(length(named_levels)) else character(0)
+  cluster_palette <- setNames(c(cluster_colors, "gray70"), cluster_levels)
+ 
+  umap_cluster_df$ClusterLabel <- factor(umap_cluster_df$ClusterLabel, levels = cluster_levels)
+ 
+  p_umap_clusters <- ggplot(umap_cluster_df, aes(x = UMAP1, y = UMAP2, label = Reference, color = ClusterLabel)) +
+    geom_point(size = 2) +
+    geom_text_repel(size = 3, show.legend = FALSE) +
+    scale_color_manual(values = cluster_palette) +
+    theme_classic() +
+    labs(title = "MDS (PCoA) Colored by Structural Cluster (Butina)",
+         x = "MDS1", y = "MDS2", color = "Cluster")
+  ggsave(file.path(out_dir, "mds_scatter_clusters.png"), p_umap_clusters, width = 9, height = 6, dpi = 150)
+} else {
+  message("Skipping cluster-colored MDS plot (too few compounds or no cluster data).")
+}
+ 
+# ── IMAGE 4: All hits structure grid ──────────────────────────────────────────
+legends_all <- sapply(refs_valid, make_legend, hits_df = df_merged)
+mols_clean  <- lapply(mols_valid, strip_name)
+ 
+img_obj <- Draw$MolsToGridImage(mols_clean, molsPerRow = 6L, subImgSize = c(600L, 500L),
+                                legends = as.list(unname(legends_all)),
+                                drawOptions = opts, returnPNG = TRUE)
+#writeBin(grid_png_raw(img_obj), file.path(out_dir, "hits_structures.png"))
+grid_png_to_file(img_obj, file.path(out_dir, "hits_structures.png"))
+ 
+# ── IMAGE 5: One row per cluster, structures + text separated via magick ───────
+library(magick)
+ 
+ 
+groups_unique <- sort(unique(component_df$Group))
+ 
+groups_unique <- sort(unique(component_df$Group))
+ 
+if (length(groups_unique) == 0) {
+  message("No multi-compound clusters (Tanimoto > 0.4) -- skipping grouped structure grid.")
+} else {
+ 
+  # image_annotate() runs text through ImageMagick's MVG "text" primitive,
+  # which can choke on quotes/percent signs/newlines in compound names and
+  # throw "non-conforming drawing primitive definition `text'". Side-step
+  # that entirely by rendering text with base R graphics (png + text()) and
+  # reading the result back in as an image. Defined here (shared scope) so
+  # both the per-compound text panels and the cluster banners can use it.
+  safe_text <- function(x) {
+    x <- as.character(x)
+    x[is.na(x)] <- ""
+    x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "")
+    gsub("[\r\n\t]", " ", x)
+  }
+ 
+  make_banner <- function(text, width_px, height_px = 50) {
+    tmp_banner <- tempfile(fileext = ".png")
+ 
+    png(tmp_banner, width = width_px, height = height_px, bg = "#EDE9F5", res = 120)
+    par(mar = c(0, 0, 0, 0), xaxs = "i", yaxs = "i")
+    plot.new()
+    plot.window(xlim = c(0, width_px), ylim = c(height_px, 0))
+ 
+    text(x = 16, y = height_px / 2, labels = safe_text(text), adj = c(0, 0.5),
+         cex = 1.6, col = "#3B2A6E", font = 2, family = "sans")
+ 
+    dev.off()
+    image_read(tmp_banner)
+  }
+ 
+  cluster_images <- lapply(groups_unique, function(grp) {
+ 
+    # ── Compounds in this cluster ──────────────────────────────────────────────
+    refs_in_grp <- component_df$Reference[component_df$Group == grp]
+    idx_in_grp  <- match(refs_in_grp, refs_valid)
+    valid_idx   <- !is.na(idx_in_grp)
+    refs_in_grp <- refs_in_grp[valid_idx]
+    idx_in_grp  <- idx_in_grp[valid_idx]
+    n_in_grp    <- length(refs_in_grp)
+ 
+    # ── 1. Draw structures with no legend ──────────────────────────────────────
+    mols_grp   <- lapply(mols_valid[idx_in_grp], strip_name)
+    blank_legs <- as.list(rep("", n_in_grp))
+ 
+    struct_obj <- Draw$MolsToGridImage(mols_grp, molsPerRow = as.integer(n_in_grp),
+                                       subImgSize = c(600L, 500L), legends = blank_legs,
+                                       drawOptions = opts, returnPNG = TRUE)
+    tmp_png    <- tempfile(fileext = ".png")
+    grid_png_to_file(struct_obj, tmp_png)
+    struct_img <- image_read(tmp_png)
+    struct_w   <- image_info(struct_img)$width
+    cell_w     <- as.integer(struct_w / n_in_grp)
+ 
+    # ── 2. Build text panel for each compound ──────────────────────────────────
+    make_text_panel <- function(lines, width_px, height_px, fontsize = 22) {
+      tmp_txt <- tempfile(fileext = ".png")
+ 
+      png(tmp_txt, width = width_px, height = height_px, bg = "white", res = 120)
+      par(mar = c(0, 0, 0, 0), xaxs = "i", yaxs = "i")
+      plot.new()
+      plot.window(xlim = c(0, width_px), ylim = c(height_px, 0))
+ 
+      y <- 28
+      for (ln in lines) {
+        text(x = 20, y = y, labels = safe_text(ln), adj = c(0, 0),
+             cex = fontsize / 18, col = "#222222", family = "sans")
+        y <- y + 30
+      }
+ 
+      dev.off()
+      image_read(tmp_txt)
+    }
+ 
+    text_panels <- lapply(seq_len(n_in_grp), function(i) {
+      ref <- refs_in_grp[i]
+      row <- df_merged %>% filter(Reference == ref) %>% slice(1)
+ 
+      eff_val <- if ("PercentEffect" %in% names(row)) row$PercentEffect[1] else NA_real_
+      secondary_marker_val  <- if ("SecondaryMarker_Intensity_Diff" %in% names(row)) row$SecondaryMarker_Intensity_Diff[1] else NA_real_
+ 
+      others    <- setdiff(seq_len(n_in_grp), i)
+      tan_lines <- sapply(others, function(j) {
+        t_val <- DataStructs$TanimotoSimilarity(fps[[idx_in_grp[i]]], fps[[idx_in_grp[j]]])
+        sprintf("  vs %s:  %.2f", refs_in_grp[j], t_val)
+      })
+ 
+      lines <- c(
+        ref,
+        sprintf("Eff: %.1f  |  td: %.1f", eff_val, secondary_marker_val),
+        strrep("-", 20),
+        "Tanimoto:",
+        tan_lines
+      )
+      panel_h <- 40 + length(lines) * 30
+ 
+      make_text_panel(lines = lines, width_px = cell_w, height_px = panel_h, fontsize = 22)
+    })
+ 
+    # ── 3. Stitch text panels side by side ─────────────────────────────────────
+    text_row <- image_append(do.call(c, text_panels), stack = FALSE)
+    text_w   <- image_info(text_row)$width
+    if (text_w < struct_w) {
+      text_row <- image_extent(text_row,
+                               geometry = paste0(struct_w, "x", image_info(text_row)$height),
+                               gravity = "West", color = "white")
+    }
+ 
+    # ── 4. Stack structures on top of text ─────────────────────────────────────
+    image_append(c(struct_img, text_row), stack = TRUE)
+  })
+ 
+  # ── Banners + stack all rows ─────────────────────────────────────────────────
+  max_width  <- max(sapply(cluster_images, function(img) image_info(img)$width))
+  final_rows <- lapply(seq_along(cluster_images), function(i) {
+    grp <- groups_unique[i]
+    n   <- sum(component_df$Group == grp)
+    img <- cluster_images[[i]]
+ 
+    if (image_info(img)$width < max_width) {
+      img <- image_extent(img, geometry = paste0(max_width, "x", image_info(img)$height),
+                          gravity = "West", color = "white")
+    }
+ 
+    banner <- make_banner(text = sprintf("Cluster %d  (%d compounds)", grp, n),
+                          width_px = max_width, height_px = 50)
+ 
+    image_append(c(banner, img), stack = TRUE)
+  })
+ 
+  final_img <- image_append(do.call(c, final_rows), stack = TRUE)
+  image_write(final_img, file.path(out_dir, "hits_structures_grouped.png"))
+  message("Saved: hits_structures_grouped.png")
+}
+# ── EXCEL EXPORT ───────────────────────────────────────────────────────────────
+wb <- createWorkbook()
+ 
+header_style    <- createStyle(fontName = "Arial", fontSize = 11, fontColour = "white",
+                               fgFill = "#3B2A6E", halign = "center",
+                               textDecoration = "bold", border = "Bottom")
+cell_style      <- createStyle(fontName = "Arial", fontSize = 10, numFmt = "0.0000",
+                               halign = "center", border = "LeftRight", borderColour = "#CCCCCC")
+cell_style_text <- createStyle(fontName = "Arial", fontSize = 10, halign = "left")
+cell_style_num  <- createStyle(fontName = "Arial", fontSize = 10, numFmt = "0.0000", halign = "right")
+cell_style_int  <- createStyle(fontName = "Arial", fontSize = 10, numFmt = "0", halign = "center")
+ 
+# ── Sheet 1: Tanimoto Similarity Matrix ───────────────────────────────────────
+addWorksheet(wb, "Tanimoto Similarity")
+sim_df <- cbind(Reference = rownames(sim_matrix), as.data.frame(sim_matrix))
+rownames(sim_df) <- NULL
+writeData(wb, "Tanimoto Similarity", sim_df, startRow = 1, startCol = 1,
+          headerStyle = header_style, borders = "surrounding")
+n_rows <- nrow(sim_df); n_cols <- ncol(sim_df)
+conditionalFormatting(wb, "Tanimoto Similarity", cols = 2:n_cols, rows = 2:(n_rows + 1),
+                      style = c("#FFFFFF", "#7B3F7A"), rule = c(0, 1), type = "colourScale")
+addStyle(wb, "Tanimoto Similarity", style = cell_style,
+         rows = 2:(n_rows + 1), cols = 2:n_cols, gridExpand = TRUE)
+addStyle(wb, "Tanimoto Similarity", style = cell_style_text,
+         rows = 2:(n_rows + 1), cols = 1, gridExpand = TRUE)
+setColWidths(wb, "Tanimoto Similarity", cols = 1,
+             widths = max(nchar(as.character(sim_df$Reference))) * 1.2 + 2)
+setColWidths(wb, "Tanimoto Similarity", cols = 2:n_cols, widths = 10)
+freezePane(wb, "Tanimoto Similarity", firstRow = TRUE, firstCol = TRUE)
+ 
+# ── Sheet 2: UMAP Results ─────────────────────────────────────────────────────
+addWorksheet(wb, "UMAP Results")
+writeData(wb, "UMAP Results", umap_df, startRow = 1, startCol = 1,
+          headerStyle = header_style, borders = "surrounding")
+n_umap_rows <- nrow(umap_df)
+addStyle(wb, "UMAP Results", style = cell_style_text,
+         rows = 2:(n_umap_rows + 1), cols = 1, gridExpand = TRUE)
+addStyle(wb, "UMAP Results", style = cell_style_num,
+         rows = 2:(n_umap_rows + 1), cols = 2:3, gridExpand = TRUE)
+setColWidths(wb, "UMAP Results", cols = 1, widths = 25)
+setColWidths(wb, "UMAP Results", cols = 2:3, widths = 14)
+freezePane(wb, "UMAP Results", firstRow = TRUE, firstCol = FALSE)
+ 
+# ── Sheet 3: Cluster Assignments ───────────────────────────────────────────────
+# Includes ALL Butina clusters (singletons too), plus:
+#   - Representative: structural centroid of the cluster (most neighbors within
+#     the Tanimoto distance cutoff)
+#   - Score: BZ/Z-Score (whichever applies) for the compound
+#   - Hit: TRUE if the compound's Score exceeds 3 (Z- or BZ-Score, whichever
+#     column applies for this run).
+addWorksheet(wb, "Clusters")
+cluster_export <- cluster_all_df %>%
+  left_join(df_merged %>% select(any_of(c("Reference", "PercentEffect", "SecondaryMarker_Intensity_Diff"))), by = "Reference") %>%
+  left_join(df_chem %>% select(Reference, Score = all_of(score_col_chem)), by = "Reference") %>%
+  group_by(Group) %>%
+  mutate(Hit = Score > 3) %>%
+  ungroup() %>%
+  arrange(Group, desc(Score))
+cluster_export$Group <- as.integer(cluster_export$Group)
+writeData(wb, "Clusters", cluster_export, startRow = 1, startCol = 1,
+          headerStyle = header_style, borders = "surrounding")
+n_cluster_rows  <- nrow(cluster_export)
+n_cluster_cols  <- ncol(cluster_export)
+cluster_colnames <- names(cluster_export)
+ 
+# Numeric columns vary depending on whether SecondaryMarker_Intensity_Diff exists for this run
+numeric_cols <- match(intersect(c("PercentEffect", "SecondaryMarker_Intensity_Diff", "Score"), cluster_colnames),
+                       cluster_colnames)
+ 
+addStyle(wb, "Clusters", style = cell_style_text,
+         rows = 2:(n_cluster_rows + 1), cols = match("Reference", cluster_colnames), gridExpand = TRUE)
+addStyle(wb, "Clusters", style = cell_style_int,
+         rows = 2:(n_cluster_rows + 1), cols = match("Group", cluster_colnames), gridExpand = TRUE)
+addStyle(wb, "Clusters", style = cell_style_num,
+         rows = 2:(n_cluster_rows + 1), cols = numeric_cols, gridExpand = TRUE)
+ 
+ 
+ 
+# Alternating row shading by cluster group
+groups <- cluster_export$Group
+for (i in seq_len(n_cluster_rows)) {
+  if (groups[i] %% 2 == 0)
+    addStyle(wb, "Clusters", rows = i + 1, cols = 1:n_cluster_cols, gridExpand = TRUE, stack = TRUE,
+             style = createStyle(fgFill = "#EDE9F5", fontName = "Arial", fontSize = 10))
+}
+ 
+summary_start_col <- n_cluster_cols + 2
+writeData(wb, "Clusters", cluster_summary, startRow = 1, startCol = summary_start_col,
+          headerStyle = header_style, borders = "surrounding")
+setColWidths(wb, "Clusters", cols = match("Reference", cluster_colnames), widths = 25)
+setColWidths(wb, "Clusters", cols = match("Group", cluster_colnames), widths = 10)
+setColWidths(wb, "Clusters", cols = numeric_cols, widths = 14)
+if ("Representative" %in% cluster_colnames)
+  setColWidths(wb, "Clusters", cols = match("Representative", cluster_colnames), widths = 14)
+if ("Hit" %in% cluster_colnames)
+  setColWidths(wb, "Clusters", cols = match("Hit", cluster_colnames), widths = 10)
+setColWidths(wb, "Clusters", cols = summary_start_col:(summary_start_col + 2), widths = c(10, 8, 40))
+freezePane(wb, "Clusters", firstRow = TRUE)
+ 
+# ── Save workbook ──────────────────────────────────────────────────────────────
+saveWorkbook(wb, file.path(out_dir, "cheminformatics_results.xlsx"), overwrite = TRUE)
+ 
+message("Export complete:")
+message("  Images: tanimoto_heatmap.png, tanimoto_distribution.png, pca_scatter.png,")
+message("umap_scatter.png, hits_structures.png, hits_structures_grouped.png")
+message("  Excel:  cheminformatics_results.xlsx (3 sheets: Tanimoto Similarity, UMAP Results, Clusters)")
+
+} else {
+  message("Fewer than 2 compounds passed the cheminformatics filters (n_chem = ", n_chem,
+          ") -- skipping heatmap/PCoA/UMAP/cluster image generation and cheminformatics_results.xlsx export.")
+}
+```
+ 
+```{r}
+# ============================================================
+# FINAL: Export Hits + QC + Chemical Filtering (consolidated)
+# ============================================================
+# The cheminformatics chunk above ends by deleting every worksheet not in
+# c("Hits","Combined Analysis","Plate Statistics","Controls") -- which wipes
+# out "Export Hits" (written in the NORMALIZED SCORE PLOT chunk) and "Hits_QC"
+# (written in the spatial-QC chunk), even though both still exist as R objects
+# (export_hits_df, hits_df_qc). This chunk restores those two sheets and adds a
+# third: "Export Hits Annotated", which is export_hits_df left-joined with the
+# spatial-QC flags and the chemical-filtering report, restricted to the wells
+# that made it into Export Hits, for one-stop downstream triage.
+ 
+if (exists("export_hits_df") && exists("fileX") && file.exists(fileX)) {
+ 
+  # Spatial QC columns, keyed on Plate/Well (Hits_QC is derived from the
+  # "Combined Analysis" sheet via hit_threshold, a different/looser cut than
+  # Export Hits, so this is a left join -- not every Export Hits row will have
+  # a QC match, and that's fine: NA here just means "not flagged by spatial QC").
+  qc_cols <- if (exists("hits_df_qc")) {
+    hits_df_qc %>%
+      mutate(across(where(is.factor), as.character)) %>%
+      select(any_of(c("Plate", "Well", "Type_of_Error", "Systematic_error",
+                       "QC_alpha", "QC_well_fold_threshold", "QC_score_outlier_sd"))) %>%
+      distinct(Plate, Well, .keep_all = TRUE)
+  } else {
+    tibble::tibble(Plate = character(), Well = character())
+  }
+ 
+  # Chemical-filtering columns, keyed on Plate/Well (df_final is the "Hits"
+  # sheet -- BZ/Z >= 3 -- enriched with SMILES/Lipinski/structural-alert risk).
+  chem_cols <- if (exists("df_final")) {
+    df_final %>%
+      mutate(across(where(is.factor), as.character)) %>%
+      select(any_of(c("Plate", "Well", "Risk", "AlertScore", "alert_flags", "AlertReason",
+                       "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
+                       "CAS", "SMILES_used", "SecondaryMarker_Intensity", "SecondaryMarker_Intensity_Diff", "Cytotoxic"))) %>%
+      distinct(Plate, Well, .keep_all = TRUE)
+  } else {
+    tibble::tibble(Plate = character(), Well = character())
+  }
+ 
+  export_hits_annotated <- export_hits_df %>%
+    left_join(qc_cols,   by = c("Plate", "Well")) %>%
+    left_join(chem_cols, by = c("Plate", "Well")) %>%
+    arrange(desc(.data[[score_col]]))
+ 
+  wb_final <- loadWorkbook(fileX)
+ 
+  # Re-add "Export Hits" / "Hits_QC" (removed by the cheminformatics cleanup
+  # step) to the main workbook. The consolidated "Export Hits Annotated"
+  # table goes into its own standalone workbook (see below), not in here.
+  for (s in c("Export Hits", "Hits_QC", "TriagedHits")) {
+    if (s %in% names(wb_final)) removeWorksheet(wb_final, s)
+  }
+ 
+  addWorksheet(wb_final, "Export Hits")
+  writeData(wb_final, "Export Hits", export_hits_df, startCol = 1, startRow = 1, colNames = TRUE)
+  freezePane(wb_final, "Export Hits", firstActiveRow = 2)
+  addFilter(wb_final, "Export Hits", rows = 1, cols = 1:ncol(export_hits_df))
+ 
+  if (exists("hits_df_qc")) {
+    hits_qc_out <- hits_df_qc %>% mutate(across(where(is.factor), as.character))
+    addWorksheet(wb_final, "Hits_QC")
+    writeData(wb_final, "Hits_QC", hits_qc_out)
+    freezePane(wb_final, "Hits_QC", firstRow = TRUE)
+    addFilter(wb_final, "Hits_QC", rows = 1, cols = 1:ncol(hits_qc_out))
+  }
+ 
+  # Also add the consolidated Export Hits + QC + chemical-filtering table as
+  # its own sheet in the main workbook (same content as the standalone
+  # "_ExportHitsAnnotated.xlsx" workbook written below).
+  addWorksheet(wb_final, "TriagedHits")
+  writeData(wb_final, "TriagedHits", export_hits_annotated, startCol = 1, startRow = 1, colNames = TRUE)
+  freezePane(wb_final, "TriagedHits", firstActiveRow = 2)
+  addFilter(wb_final, "TriagedHits", rows = 1, cols = 1:ncol(export_hits_annotated))
+ 
+  # Keep "TriagedHits"/"Export Hits"/"Hits_QC" up front, everything else in a sensible order.
+  final_order <- c("TriagedHits", "Export Hits", "Hits_QC",
+                    "Hits", "Combined Analysis", "Plate Statistics", "Controls")
+  final_order <- c(final_order[final_order %in% names(wb_final)],
+                    setdiff(names(wb_final), final_order))
+  worksheetOrder(wb_final) <- match(final_order, names(wb_final))
+ 
+  saveWorkbook(wb_final, fileX, overwrite = TRUE)
+ 
+  # --- Standalone "Export Hits Annotated" workbook -------------------------
+  # A brand-new spreadsheet whose primary table is export_hits_annotated:
+  # the Export Hits rows, left-joined with spatial-QC flags and the chemical-
+  # filtering report, restricted to wells that made it into Export Hits.
+  annotated_file <- file.path(
+    dirname(fileX),
+    paste0(tools::file_path_sans_ext(basename(fileX)), "_ExportHitsAnnotated.xlsx")
+  )
+ 
+  wb_annotated <- createWorkbook()
+  addWorksheet(wb_annotated, "Export Hits Annotated")
+  writeData(wb_annotated, "Export Hits Annotated", export_hits_annotated, startCol = 1, startRow = 1, colNames = TRUE)
+  freezePane(wb_annotated, "Export Hits Annotated", firstActiveRow = 2)
+  addFilter(wb_annotated, "Export Hits Annotated", rows = 1, cols = 1:ncol(export_hits_annotated))
+ 
+  saveWorkbook(wb_annotated, annotated_file, overwrite = TRUE)
+ 
+  cat("Export Hits Annotated workbook written:", annotated_file, "--",
+      nrow(export_hits_annotated),
+      "rows (Export Hits joined with spatial-QC flags and chemical-filtering report)\n")
+ 
+} else {
+  message("Skipping consolidated Export Hits sheet: export_hits_df or fileX not found in this session.")
+}
+```
+ 
+
   
 ```{r}
 # RDKit imports
