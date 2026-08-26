@@ -78,13 +78,15 @@ results/
 *.csv
 *.xlsx
 
-#Images:
+# Images:
 *.png
 *.PNG
 *.jpg
 *.JPG
 *.TIFF
 *.TIF
+*.pdf
+*.PDF
 
 # CellProfiler (optional, if you have large pipeline outputs)
 # Adjust if these are needed for reproducibility
