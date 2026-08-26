@@ -536,9 +536,9 @@ process_batch <- function(batch_row, file_Location) {
 # Edit this once -- every chunk below that needs to bootstrap from disk
 # (i.e. before dfSelection itself has been loaded) reuses this same value
 # instead of re-hardcoding the path.
-project_data_dir <- "/home/userX/pathsource/"
 
-
+#project_data_dir <- "/home/userX/pathsource/"
+project_data_dir <- "/Users/dylan/Documents/chemical_screen/ChemDiversity2026/hitpick/gitstage/DownloadCondenScreen/"
 save_Location <- project_data_dir
 
 file_Location <- save_Location
@@ -616,13 +616,15 @@ combined_data <- rbindlist(lapply(batch_files, read_merged_batch), fill = TRUE)
 fwrite(combined_data, file.path(file_Location, "final_combined_result.csv"), na = "")
 cat("Combined:", nrow(combined_data), "rows across", length(batch_files), "batches\n")
  
+combined_data
 ```
 
 ```{r}
-cat("Class:", class(manifest), "\n")
-cat("Columns:", names(manifest), "\n")
-print(head(manifest, 10))
+# cat("Class:", class(manifest), "\n")
+# cat("Columns:", names(manifest), "\n")
+# print(head(manifest, 10))
  
+colnames(combined_data)
 ```
 
 ```{r}
@@ -633,9 +635,9 @@ print(head(manifest, 10))
 extract_info_vectorized <- function(combinedDF) {
 
   # Plate id lives in the folder PATH; well/site live in the FILE name. Need BOTH columns.
-  path_col <- intersect(c("PathName_DAPI","PathName_GFP","PathName_WholeCell","PathName_tdTomato",
+  path_col <- intersect(c("Image_PathName_DAPI","Image_PathName_GFP","Image_PathName_WholeCell","Image_PathName_tdTomato",
                           grep("^PathName_", names(combinedDF), value = TRUE)), names(combinedDF))[1]
-  file_col <- intersect(c("FileName_DAPI","FileName_GFP","FileName_WholeCell","FileName_tdTomato",
+  file_col <- intersect(c("Image_FileName_DAPI","Image_FileName_GFP","Image_FileName_WholeCell","Image_FileName_tdTomato",
                           grep("^FileName_", names(combinedDF), value = TRUE)), names(combinedDF))[1]
   if (is.na(path_col)) stop("No PathName_* column found (needed for plate id).")
   if (is.na(file_col)) stop("No FileName_* column found (needed for well/site).")
@@ -669,7 +671,7 @@ extract_info_vectorized <- function(combinedDF) {
 # Apply
 # Apply — parse ONCE per unique image (path+file), then join back to every cell.
 # Running str_match on the full per-cell table (tens of millions of rows) is what hung.
-key <- intersect(c("PathName_DAPI", "FileName_DAPI"), names(combined_data))
+key <- intersect(c("Image_PathName_DAPI", "Image_FileName_DAPI"), names(combined_data))
 u   <- unique(combined_data[, ..key])                       # ~#images, not #cells
 u[, c("plate_Num", "Well_Num", "Imagecopy_Num") := extract_info_vectorized(u)]
 
@@ -682,7 +684,7 @@ combined_data[u, on = key,
 .unclean   <- is.na(u$plate_Num) | is.na(u$Well_Num) | is.na(u$Imagecopy_Num)
 .is_Aplate <- (grepl("^A", u$plate_Num) %in% TRUE) | grepl("[-_]A\\d{4,}", u$PathName_DAPI)
 unparsed_A_plates <- unique(u[.unclean & .is_Aplate,
-                              .(FileName_DAPI, PathName_DAPI, plate_Num, Well_Num, Imagecopy_Num)])
+                              .(Image_FileName_DAPI, Image_PathName_DAPI, plate_Num, Well_Num, Imagecopy_Num)])
 cat("Un-parseable A-plate files:", nrow(unparsed_A_plates), "\n")
 
 #-----------------------------------------------------------------------------
@@ -709,11 +711,14 @@ combined_Df <- combined_data
  
 
 unique(combined_Df$plate_Num)
+colnames(combined_Df)
+
 
 ```
 
 
 ```{r}
+
 # INDIVIDUAL CONDITION/CONTROL STATISTICS 
 #------------------------------------------------------------------------------
 #[OPTIONAL] Filter out bottom 75% (to control for a transfection efficiency of 1:4)
@@ -726,23 +731,26 @@ unique(combined_Df$plate_Num)
 # foci are OPTIONAL: if a channel is missing the analysis skips it and never errors.
 combined_Df <- as.data.table(combined_Df)
 
-# Rename `from` -> `to` only when `from` exists and `to` does not. This bridges the
-# loader's output names to the legacy names used downstream (so older exports that
-# already use the legacy names pass through untouched).
+# Rename `from` -> `to` only when `from` exists and `to` does not. Bridges the
+# loader's actual CellProfiler export names to the bare names the pipeline
+# below expects (group_by/summarise reference these bare names directly).
 rename_if_present <- function(dt, from, to) {
   if (from %in% names(dt) && !(to %in% names(dt))) setnames(dt, from, to)
   invisible(dt)
 }
-rename_if_present(combined_Df, "NucFoci",                                 "Children_GFP_foci_Count")  # per-cell nuclear foci count
-rename_if_present(combined_Df, "Nuc_Area",                                "AreaShape_Area")           # nucleus area
-rename_if_present(combined_Df, "Nuc_FormFactor",                          "AreaShape_FormFactor")     # nucleus form factor
+
+rename_if_present(combined_Df, "Image_ImageNumber",                                     "ImageNumber")                          # per-image id, used in group_by()
+rename_if_present(combined_Df, "expanded_Nuclei_Children_GFP_foci_Count",               "Children_GFP_foci_Count")              # per-cell nuclear foci count
+rename_if_present(combined_Df, "Nuclei_AreaShape_Area",                                 "AreaShape_Area")                       # nucleus area
+rename_if_present(combined_Df, "Nuclei_AreaShape_FormFactor",                           "AreaShape_FormFactor")                 # nucleus form factor
+
 # NOTE: the "from" names below are literal CellProfiler export column names
 # (tied to the actual channel/reporter used, e.g. tdTomato) and must stay as-is
 # for the rename to match real input files. Everything downstream of this point
 # uses the generic "SecondaryMarker" name instead, regardless of which reporter
 # was actually used upstream.
-rename_if_present(combined_Df, "Intensity_IntegratedIntensity_tdTomato",  "Intensity_IntegratedIntensity_P2A_SecondaryMarker")
-rename_if_present(combined_Df, "AreaShape_Area_tdTomato",                  "AreaShape_Area_P2A_SecondaryMarker")
+rename_if_present(combined_Df, "tdTomato_Intensity_IntegratedIntensity_P2A_tdTomato",   "Intensity_IntegratedIntensity_P2A_SecondaryMarker")
+rename_if_present(combined_Df, "AreaShape_Area_P2A_tdTomato",                            "AreaShape_Area_P2A_SecondaryMarker")   # not present in this export; 
 
 # Presence flags: column exists AND has at least one non-NA value.
 has_col <- function(dt, x) x %in% names(dt) && any(!is.na(dt[[x]]))
@@ -821,7 +829,7 @@ combined_Df <- combined_Df %>%
     Avg_Foci      = mean(mean_Nuc_Foci, na.rm = TRUE),
 
     SecondaryMarker_Area = if (has_secondary_marker_area) mean(AreaShape_Area_P2A_SecondaryMarker, na.rm = TRUE) else NA_real_,
-    SecondaryMarker      = if (has_secondary_marker)  mean(Intensity_IntegratedIntensity_P2A_SecondaryMarker, na.rm = TRUE) else NA_real_,
+    SecondaryMarker_Intensity      = if (has_secondary_marker)  mean(Intensity_IntegratedIntensity_P2A_SecondaryMarker, na.rm = TRUE) else NA_real_,
 
     # NEW per-condition metrics (materialized as NA when the channel is absent so
     # downstream select()/across()/diff calls never break) ----------------------
@@ -846,7 +854,7 @@ pos_Ctrl_DF <- combined_Df %>%
     cv_Pos        = cv(Avg_Foci) * 100,
 
     SecondaryMarker_Pos_Area      = if (has_secondary_marker_area) mean(SecondaryMarker_Area, na.rm=TRUE) else NA_real_,
-    Nuclear_Pos_SecondaryMarker   = if (has_secondary_marker)  mean(SecondaryMarker, na.rm=TRUE)      else NA_real_,
+    Nuclear_Pos_SecondaryMarker   = if (has_secondary_marker)  mean(SecondaryMarker_Intensity, na.rm=TRUE)      else NA_real_,
     .groups = "drop"
   )
 
@@ -860,7 +868,7 @@ neg_Ctrl_DF <- combined_Df %>%
     cv_Neg        = cv(Avg_Foci) * 100,
 
     SecondaryMarker_Neg_Area    = if (has_secondary_marker_area) mean(SecondaryMarker_Area, na.rm = TRUE) else NA_real_,
-    Nuclear_Neg_SecondaryMarker = if (has_secondary_marker)  mean(SecondaryMarker, na.rm = TRUE)      else NA_real_,
+    Nuclear_Neg_SecondaryMarker = if (has_secondary_marker)  mean(SecondaryMarker_Intensity, na.rm = TRUE)      else NA_real_,
 
     .groups = "drop"
   )
@@ -893,12 +901,12 @@ plate_Summary$SB_Plate <- SB_Plate$SB_Plate
 
 p_ctrls <- combined_Df %>% filter( Condition == pos_Ctrl) %>%
   group_by(plate_Num) %>%
-     summarise(Control = paste0(pos_Ctrl), across(c( Nuclei_Number, Avg_Foci, SecondaryMarker), mean, na.rm = TRUE), Condition = pos_Ctrl)
+     summarise(Control = paste0(pos_Ctrl), across(c( Nuclei_Number, Avg_Foci, SecondaryMarker_Intensity), mean, na.rm = TRUE), Condition = pos_Ctrl)
 
 
 n_ctrls <- combined_Df %>% filter( Condition == neg_Ctrl) %>% 
   group_by(plate_Num) %>%
-     summarise(Control = paste0(neg_Ctrl), across(c(Nuclei_Number, Avg_Foci, SecondaryMarker), mean, na.rm = TRUE), Condition = neg_Ctrl)
+     summarise(Control = paste0(neg_Ctrl), across(c(Nuclei_Number, Avg_Foci, SecondaryMarker_Intensity), mean, na.rm = TRUE), Condition = neg_Ctrl)
 
 #Export controls summary:
 ctrls <- rbind(p_ctrls, n_ctrls)
@@ -941,7 +949,7 @@ combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")
     # Calculate normalized differences for nuclear area, form factor, and cell count
     NuclearAreaDiff = (Nuclear_Area - mean(Nuclear_Area)) / mean(Nuclear_Area) * 100,
     FormFactorDiff = (FormFactor - mean(FormFactor)) / mean(FormFactor) * 100,
-    SecondaryMarker_Diff = if (has_secondary_marker) (SecondaryMarker - mean(SecondaryMarker)) / mean(SecondaryMarker) * 100 else NA_real_,
+    SecondaryMarker_Intensity_Diff = if (has_secondary_marker) (SecondaryMarker_Intensity - mean(SecondaryMarker_Intensity)) / mean(SecondaryMarker_Intensity) * 100 else NA_real_,
     CellCountDiff = (Nuclei_Number - mean(Nuclei_Number)) / mean(Nuclei_Number) * 100,
 
     # NEW: per-condition CHANGE (% vs plate mean) in nuclear-foci morphology
@@ -952,7 +960,7 @@ combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")
 
 # FAILSAFE: if secondary marker was absent, drop the all-NA diff column so the optional
 # secondary marker residual analysis below (gated on column presence) is cleanly skipped.
-if (!has_secondary_marker) temp_stats_Df$SecondaryMarker_Diff <- NULL
+if (!has_secondary_marker) temp_stats_Df$SecondaryMarker_Intensity_Diff <- NULL
 
 #Remove any duplicated columns up till now 
 
@@ -965,22 +973,11 @@ temp_stats_Df <- temp_stats_Df %>%
   ) %>%
   ungroup()
 
-#Else:
-# temp_stats_Df <- temp_stats_Df %>%
-#   group_by(plate_Num, Well_Num) %>%
-#   mutate(Viability =
-#     CellCountDiff) %>%
-#   ungroup()
 
-temp_stats_Df %>% arrange(desc(NuclearAreaDiff))
 
 ```
 
-```{r}
-temp_stats_Df[order(temp_stats_Df$PercentEffect, decreasing = TRUE),] 
 
-colnames(temp_stats_Df)
-```
 
 <!-- secondary marker quadrant + residual-rescue analysis relocated to the NORMALIZED SCORE PLOT section below. -->
 
@@ -1083,15 +1080,15 @@ bs_res <- temp_stats_Df %>%
  temp_stats_Df <- temp_stats_Df %>%
   left_join(bs_res, by = c("plate_Num", "Well_Num")) %>%
   rename(BZScore = BZ_Score)
+  message("Used BZ-Score.")
 
 } else {
   # Explicitly create columns so downstream code doesn't break
   temp_stats_Df$BScore  <- NA_real_
   temp_stats_Df$BZScore <- NA_real_
 
-  if (useBZ && plateSize < 96) {
-    message("Skipping B-score: plate size < 96 wells (medpolish is unstable with too few wells).")
-  }
+  message("Skipping B-score: plate size < 96 wells (medpolish is unstable with too few wells).")
+  
 }
  
  
@@ -1150,11 +1147,11 @@ for (plate in seq_len(length(unique(combined_Df$plate_Num)))){
     
   plots <- list(nuc_plate, cell_plate)
 
-if (has_secondary_marker && "SecondaryMarker" %in% names(sub_df) && any(!is.na(sub_df$SecondaryMarker))) {
+if (has_secondary_marker && "SecondaryMarker_Intensity" %in% names(sub_df) && any(!is.na(sub_df$SecondaryMarker_Intensity))) {
   SecondaryMarker_plate <- plate_plot(
     data = sub_df,
     position = Well_Num,
-    value = SecondaryMarker,
+    value = SecondaryMarker_Intensity,
     plate_size = plateSize,
     title = paste(plate_List[plate], ", Avg. SecondaryMarker Intensity/Condition:", sep = ""),
     title_size = 14,
@@ -1188,7 +1185,7 @@ drop_all_na_cols <- function(df, cols) {
 # ---- CONTROLS (optional secondary marker) ----
 ctrl_cols <- c("Nuclei_Number", "Avg_Foci")
 if (has_secondary_marker_area) ctrl_cols <- c(ctrl_cols, "SecondaryMarker_Area")
-if (has_secondary_marker)  ctrl_cols <- c(ctrl_cols, "SecondaryMarker")
+if (has_secondary_marker)  ctrl_cols <- c(ctrl_cols, "SecondaryMarker_Intensity")
 
 p_ctrls <- combined_Df %>%
   filter(Condition == pos_Ctrl) %>%
@@ -1218,7 +1215,7 @@ ctrls <- bind_rows(p_ctrls, n_ctrls) %>%
   )
 
 if ("SecondaryMarker_Area" %in% names(ctrls)) ctrls <- ctrls %>% rename(SecondaryMarker_Area = SecondaryMarker_Area)
-if ("SecondaryMarker"      %in% names(ctrls)) ctrls <- ctrls %>% rename(SecondaryMarkerIntensity = SecondaryMarker)
+if ("SecondaryMarker_Intensity"      %in% names(ctrls)) ctrls <- ctrls %>% rename(SecondaryMarkerIntensity = SecondaryMarker_Intensity)
 
 # ---- PLATE SUMMARY: round + rename (robust) + optional drops ----
 plate_Summary <- plate_Summary %>%
@@ -1262,7 +1259,7 @@ base_cols <- c("BZScore", "ZScore", "Viability", "plate_Num", "Well_Num", "ZPrim
 
 secondary_marker_cols <- character(0)
 if (has_secondary_marker_area) secondary_marker_cols <- c(secondary_marker_cols, "SecondaryMarker_Area")
-if (has_secondary_marker)  secondary_marker_cols <- c(secondary_marker_cols, "SecondaryMarker", "SecondaryMarker_Diff")
+if (has_secondary_marker)  secondary_marker_cols <- c(secondary_marker_cols, "SecondaryMarker_Intensity", "SecondaryMarker_Intensity_Diff")
 if ("residual" %in% names(temp_stats_Df)) secondary_marker_cols <- c(secondary_marker_cols, "residual")
 
 # NEW optional readouts to carry into the Combined Analysis export. They are kept
@@ -1290,13 +1287,13 @@ combined_Df_out <- combined_Df_out %>%
   arrange(desc(.data[[score_col]])) %>%
   mutate(across(where(is.numeric), ~ round(.x, 2)))
 
-hits_df <- combined_Df_out %>% filter(.data[[score_col]] >= 3)
+hits_df <- combined_Df_out %>% filter(.data[[score_col]] >= 3 & .data$Viability >= -50 & .data$SecondaryMarker_Intensity_Diff >= -50)
 
     
 
 # ---- DROP secondary marker columns if they are entirely NA ----
 secondary_marker_cols_all <- c(
-  "SecondaryMarker_Area", "SecondaryMarker", "SecondaryMarker_Diff",
+  "SecondaryMarker_Area", "SecondaryMarker_Intensity", "SecondaryMarker_Intensity_Diff",
   "SecondaryMarker_Area", "SecondaryMarkerIntensity",
   "Pos_SecondaryMarkerArea", "Neg_SecondaryMarkerArea",
   "Pos_SecondaryMarkerIntensity", "Neg_SecondaryMarkerIntensity", "residual"
@@ -1345,7 +1342,7 @@ options(scipen = 999)
 # ------------- DATA LOADING AND PREPARATION -------------
 # Load workbook from predefined location (project_data_dir, defined earlier)
 file_Location <- project_data_dir
-export_File <- paste0(file_Location, "CondenScreenV2_temp.xlsx" )  
+export_File <- paste0(file_Location, "CondenScreenV2.xlsx" )  
 save_Location <- file_Location
  image_Save_Location <- save_Location
 wb <- loadWorkbook(export_File)
@@ -1356,6 +1353,7 @@ merged_df <- read.xlsx(wb, sheet = "Combined Analysis")
 # Convert numeric columns to proper type
 #merged_df <- merged_df[!as.character(merged_df$Plate) %in% c("45", "46", "47"), ]
 #EDIT: Change to location of a file linking compound/gene names to each well, if applicable, else comment out, and run the following 
+#Make sure plateMap has columns for Plate, Well, and Reference (or Gene/Compound) to merge with the main data frame.
 #############################################################
 template_location <- file.path(file_Location, "plateMap.xlsx")
 template_exists <- file.exists(template_location)
@@ -1447,120 +1445,160 @@ saveWorkbook(wb, export_File, overwrite = TRUE)
 ```
  
 ```{r}
- #NORMALIZED SCORE PLOT:
- 
+#NORMALIZED SCORE PLOT:
+
 # == secondary marker QUADRANT + RESIDUAL RESCUE (relocated here from mid-pipeline) =====
 # Runs only when secondary marker data exist. Operates on the final reloaded `merged_df`
-# (which carries PercentEffect, SecondaryMarker_Diff, Plate, Well), saves the quadrant
+# (which carries PercentEffect, SecondaryMarker_Intensity_Diff, Plate, Well), saves the quadrant
 # and residual-rescue figures next to the normalized-score plot, and adds:
 #   - `residual`        : numeric, non-NA only for residual-rescued wells
 #   - `residual_rescue` : TRUE/FALSE flag written to the Excel sheet
- 
+
+# --- small helper: write one plot to N paths instead of a ggsave() call per path ---
+save_plot <- function(plot, paths, width, height, dpi = 300) {
+  purrr::walk(paths, ~ggsave(.x, plot, width = width, height = height, dpi = dpi))
+}
+
+# --- Resolve the score column ONCE, checked for real values, not just existence ---
+# Previously this was resolved in two separate places that could disagree:
+#   1) `score_col_hc` (inside the classification block below) checked
+#      `any(!is.na(BZScore))` before falling back to ZScore.
+#   2) `score_col` (used later for bz_hit / the normalized-score plot) only checked
+#      `"BZScore" %in% names(merged_df)` -- existence, not populated-ness.
+# If BZScore exists as a column but is all-NA at this point in the pipeline, (1)
+# correctly falls back to ZScore while (2) still picks BZScore. That mismatch is
+# consistent with what you're seeing: hit_class collapsing to just
+# Inactive/Low-viability (score comparisons silently evaluate to NA and fall
+# through case_when to the catch-all), only one label surviving (the
+# Confirmed/Suspect/Marker-only/Residual-rescued branches never fire), and the
+# normalized score plot rendering empty. Resolving it once, with the same
+# populated-ness check, removes the possibility of the two disagreeing.
+resolve_score_col <- function(df) {
+  if ("BZScore" %in% names(df) && any(is.finite(df$BZScore))) return("BZScore")
+  if ("ZScore"  %in% names(df) && any(is.finite(df$ZScore)))  return("ZScore")
+  stop("Neither BZScore nor ZScore has any finite values in merged_df -- ",
+       "check the upstream normalization step before this block runs.")
+}
+score_col <- resolve_score_col(merged_df)
+cat(sum(!is.finite(merged_df[[score_col]])), "of", nrow(merged_df),
+    "wells have a non-finite", score_col, "value.\n")
+
 # Fallback for restarted sessions where `merged_df` was reloaded directly from
 # CondenScreenV2.xlsx and the earlier `has_secondary_marker <- has_col(...)` step never ran.
 # Treat secondary marker as present if the GUI toggle was ON (when that's known)
-# AND `SecondaryMarker_Diff` exists in merged_df and is actually populated (not
+# AND `SecondaryMarker_Intensity_Diff` exists in merged_df and is actually populated (not
 # all-NA, which is how the earlier pipeline marks "no secondary marker channel").
 if (!exists("has_secondary_marker")) {
-  .secondary_marker_data_present <- "SecondaryMarker_Diff" %in% names(merged_df) &&
-    any(!is.na(merged_df$SecondaryMarker_Diff))
+  .secondary_marker_data_present <- "SecondaryMarker_Intensity_Diff" %in% names(merged_df) &&
+    any(!is.na(merged_df$SecondaryMarker_Intensity_Diff))
   has_secondary_marker <- if (exists("useSecondaryMarker")) {
     useSecondaryMarker && .secondary_marker_data_present
   } else {
     .secondary_marker_data_present
   }
 }
- 
-if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
- 
+
+if (has_secondary_marker && "SecondaryMarker_Intensity_Diff" %in% names(merged_df)) {
+
   out_dir <- paste0(save_Location, "residuals/")
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
- 
+
   # drop any stale residual columns so the joins below stay clean
   merged_df <- merged_df %>% dplyr::select(-dplyr::any_of(c("residual", "residual_rescue")))
- 
+
   # --- Classify wells ---
   # TotalPercentSecondaryMarker: secondary marker signal expressed as % of the plate mean
-  # (SecondaryMarker_Diff is already the % difference from the plate mean, so 100 + diff).
+  # (SecondaryMarker_Intensity_Diff is already the % difference from the plate mean, so 100 + diff).
   #
   # Hit-class boundary is driven by Z/BZ-score > 3 (not PercentEffect). A well
   # can be PercentEffect >= 40 and still be gray/red/yellow if its Z/BZ-score
   # doesn't clear 3 -- PercentEffect is shown on the y-axis but no longer used
   # for the color classification.
-  score_col_hc <- if (exists("score_col")) score_col else if ("BZScore" %in% names(merged_df) && any(!is.na(merged_df$BZScore))) "BZScore" else "ZScore"
- 
+  score_col_hc <- score_col  # single source of truth, resolved above
+
   secondary_marker_Df <- merged_df %>%
     mutate(
-      TotalPercentSecondaryMarker = 100 + SecondaryMarker_Diff,
+      TotalPercentSecondaryMarker = 100 + SecondaryMarker_Intensity_Diff,
       secondary_marker_outlier = TotalPercentSecondaryMarker > 150,
       score_value_hc = .data[[score_col_hc]],
- 
+
       hit_class = case_when(
         # Viability is a % difference from the plate mean (centered at 0), so
         # "<= 50% viable" corresponds to a drop of more than 50 percentage
         # points relative to the plate mean, i.e. Viability < -50.
         Viability < -50 ~ "Low viability / toxic",
- 
+
         secondary_marker_outlier ~ "secondary marker outlier",
- 
+
         score_value_hc > 3 & Viability >= -50 & TotalPercentSecondaryMarker >= 75 ~
           "Confirmed hit",
- 
+
         score_value_hc > 3 & Viability >= -50 & TotalPercentSecondaryMarker < 75 ~
           "Suspect — co-suppressed",
- 
+
+        # Not a phenotypic hit (score <= 3), but the marker channel itself is
+        # suppressed -- marker-specific toxicity / off-target quenching / signal
+        # loss unrelated to the phenotype of interest, not a co-suppressed hit.
         score_value_hc <= 3 & TotalPercentSecondaryMarker < 75 ~
-          "secondary marker suppressed only",
- 
+          "Marker-only suppression (non-hit)",
+
         TRUE ~ "Inactive"
       ),
- 
+
       hit_class = factor(
         hit_class,
         levels = c(
           "Confirmed hit",
           "Low viability / toxic",
           "Suspect — co-suppressed",
-          "secondary marker suppressed only",
+          "Marker-only suppression (non-hit)",
           "Inactive",
           "secondary marker outlier"
         )
       )
     )
- 
+
+  cat("hit_class counts:\n")
+  print(table(secondary_marker_Df$hit_class, useNA = "ifany"))
+
   # --- Colors ---
   hit_colors <- c(
-    "Confirmed hit"            = "steelblue",
-    "Low viability / toxic"    = "black",
-    "Suspect — co-suppressed"  = "tomato",
-    "secondary marker suppressed only" = "goldenrod",
-    "Inactive"                 = "gray70",
-    "secondary marker outlier"         = "darkgreen"
+    "Confirmed hit"                     = "steelblue",
+    "Low viability / toxic"             = "black",
+    "Suspect — co-suppressed"           = "tomato",
+    "Marker-only suppression (non-hit)" = "goldenrod",
+    "Inactive"                          = "gray70",
+    "secondary marker outlier"          = "darkgreen"
   )
- 
+
   # --- Plot limits ---
   y_max <- max(secondary_marker_Df$PercentEffect, na.rm = TRUE)
   y_min <- min(secondary_marker_Df$PercentEffect, na.rm = TRUE)
   x_min <- min(secondary_marker_Df$TotalPercentSecondaryMarker, na.rm = TRUE)
   x_max <- max(secondary_marker_Df$TotalPercentSecondaryMarker, na.rm = TRUE)
- 
+
   # --- Suspect wells for residual model ---
   suspects <- secondary_marker_Df %>% filter(hit_class == "Suspect — co-suppressed")
- 
+
   if (nrow(suspects) >= 3) {
- 
+
     # --- Residual model ---
     suspect_model <- lm(PercentEffect ~ TotalPercentSecondaryMarker, data = suspects)
     model_summary <- summary(suspect_model)
- 
+
     suspects <- suspects %>%
       mutate(
         fitted        = fitted(suspect_model),
         residual      = residuals(suspect_model),
         residual_rank = rank(-residual),
+        # Rescue rule: primary effect is >=20 PercentEffect points stronger than
+        # marker suppression alone predicts, AND the well is still viable.
+        # 20 is a fixed threshold, not derived from model fit (e.g. not
+        # residual-SD-based) -- worth reporting relative to model_summary$sigma
+        # if this needs to be justified downstream.
         residual_hit  = residual >= 20 & Viability >= -50
       )
- 
+
     # --- Save model summary ---
     sink(file.path(out_dir, "suspect_model_summary.txt"))
     cat("=== Suspect Cluster Regression Model ===\n\n")
@@ -1576,21 +1614,21 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
     cat("Rescued hits:", sum(suspects$residual_hit), "\n")
     cat("Total suspects:", nrow(suspects), "\n")
     sink()
- 
+
     # --- Add residual-rescued flag back onto main plotting df ---
     rescued_ids <- suspects %>%
       filter(residual_hit) %>%
       select(Plate, Well)
- 
+
     secondary_marker_Df <- secondary_marker_Df %>%
       left_join(
         rescued_ids %>% mutate(residual_rescued = TRUE),
         by = c("Plate", "Well")
       ) %>%
       mutate(residual_rescued = ifelse(is.na(residual_rescued), FALSE, residual_rescued))
- 
+
   } else {
- 
+
     suspects <- suspects %>%
       mutate(
         fitted        = NA_real_,
@@ -1598,12 +1636,12 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
         residual_rank = NA_real_,
         residual_hit  = FALSE
       )
- 
+
     secondary_marker_Df <- secondary_marker_Df %>% mutate(residual_rescued = FALSE)
- 
+
     message("Too few suspects (", nrow(suspects), ") for residual model -- skipping residual rescue.")
   }
- 
+
   # --- hit_class_final: folds in residual-rescue + low-viability override ---
   # (computed once, regardless of which branch above ran, so p1 only needs
   # to be built a single time below)
@@ -1621,30 +1659,41 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
           "Residual-rescued",
           "Low viability / toxic",
           "Suspect — co-suppressed",
-          "secondary marker suppressed only",
+          "Marker-only suppression (non-hit)",
           "Inactive",
           "secondary marker outlier"
         )
       )
     )
- 
+
   hit_colors_final <- c(
-    "Confirmed hit"            = "steelblue",
-    "Residual-rescued"         = "steelblue",
-    "Low viability / toxic"    = "black",
-    "Suspect — co-suppressed"  = "tomato",
-    "secondary marker suppressed only" = "goldenrod",
-    "Inactive"                 = "gray70",
-    "secondary marker outlier"         = "darkgreen"
+    "Confirmed hit"                     = "steelblue",
+    "Residual-rescued"                  = "steelblue",
+    "Low viability / toxic"             = "black",
+    "Suspect — co-suppressed"           = "tomato",
+    "Marker-only suppression (non-hit)" = "goldenrod",
+    "Inactive"                          = "gray70",
+    "secondary marker outlier"          = "darkgreen"
   )
- 
+
+  # single label-eligibility flag replaces two separate geom_text_repel() filter blocks
+  secondary_marker_Df <- secondary_marker_Df %>%
+    mutate(
+      label_this =
+        (hit_class_final %in% c("Confirmed hit", "Residual-rescued") & PercentEffect > 33.3) |
+        (PercentEffect > 75 &
+           !hit_class_final %in% c("Suspect — co-suppressed", "Marker-only suppression (non-hit)", "Low viability / toxic"))
+    )
+
   # --- P1: quadrant plot (built once; viable residual-rescued labeled in blue) ---
   p1 <- ggplot(
     secondary_marker_Df,
     aes(x = TotalPercentSecondaryMarker, y = PercentEffect, color = hit_class_final)
   ) +
     # --- Points, layered so gray "Inactive" wells fade into the background ---
-    # --- and the blue confirmed/rescued hits stand out clearly.            ---
+    # --- and the blue confirmed/rescued hits stand out clearly. Kept as three ---
+    # --- explicit layers (rather than one aes-mapped layer) so z-order is    ---
+    # --- guaranteed without having to pre-sort the data frame.              ---
     geom_point(
       data = secondary_marker_Df %>% filter(hit_class_final == "Inactive"),
       alpha = 0.25, size = 0.8
@@ -1658,25 +1707,7 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
       alpha = 0.9, size = 2.2
     ) +
     geom_text_repel(
-      data = secondary_marker_Df %>%
-        filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued"), PercentEffect > 33.3),
-      aes(label = Reference),
-      size = 3,
-      max.overlaps = Inf,
-      box.padding = 0.3,
-      point.padding = 0.2,
-      show.legend = FALSE
-    ) +
-    # Also label any well with a strong effect (>75%) that isn't secondary marker-suppressed
-    # (red "Suspect" or yellow "secondary marker suppressed only"), even if it didn't clear
-    # the secondary marker/viability bars for "Confirmed hit"
-    geom_text_repel(
-      
-      data = secondary_marker_Df %>%
-        filter(PercentEffect > 75,
-           !hit_class_final %in% c("Suspect — co-suppressed", "secondary marker suppressed only", "Low viability / toxic")),
-      
-       
+      data = secondary_marker_Df %>% filter(label_this),
       aes(label = Reference),
       size = 3,
       max.overlaps = Inf,
@@ -1716,9 +1747,9 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
       legend.text = element_text(size = 9),
       legend.key.size = unit(0.4, "cm")
     )
- 
+
   if (nrow(suspects) >= 3) {
- 
+
     # --- P2: residual rescue plot ---
     p2 <- ggplot(suspects, aes(x = TotalPercentSecondaryMarker, y = PercentEffect)) +
       geom_segment(
@@ -1751,7 +1782,7 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
       ) +
       theme_bw(base_size = 12) +
       theme(legend.position = "bottom")
- 
+
     combined <- p1 / p2
     # print() can occasionally exceed the RStudio Plots pane's minimum size and
     # throw "Plots window too small"; that's a display-only issue, the figures
@@ -1759,138 +1790,149 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df)) {
     tryCatch(print(combined), error = function(e) {
       message("Skipping inline preview of combined plot (display area too small): ", conditionMessage(e))
     })
- 
-    ggsave(file.path(out_dir, "p1_percenteffect_quadrant.png"), p1, width = 10, height = 7, dpi = 300)
-    ggsave(file.path(out_dir, "p2_residual_rescue.png"), p2,       width = 10, height = 7,  dpi = 300)
-    ggsave(file.path(out_dir, "residual_plots.png"),     combined, width = 10, height = 14, dpi = 300)
-    ggsave(paste0(image_Save_Location, "SecondaryMarker_quadrant.pdf"), p1, width = 10, height = 7, dpi = 300)
-    ggsave(paste0(image_Save_Location, "SecondaryMarker_residual_rescue.pdf"), p2, width = 10, height = 7, dpi = 300)
- 
+
+    save_plot(p1, file.path(out_dir, "p1_percenteffect_quadrant.png"), 10, 7)
+    save_plot(p2, file.path(out_dir, "p2_residual_rescue.png"), 10, 7)
+    save_plot(combined, file.path(out_dir, "residual_plots.png"), 10, 14)
+    save_plot(p1, paste0(image_Save_Location, "SecondaryMarker_quadrant.pdf"), 10, 7)
+    save_plot(p2, paste0(image_Save_Location, "SecondaryMarker_residual_rescue.pdf"), 10, 7)
+
     # --- bring `residual` back onto merged_df for viable RESCUED wells only ---
     merged_df <- merged_df %>%
       left_join(suspects %>% filter(residual_hit) %>% select(Plate, Well, residual),
                 by = c("Plate", "Well"))
- 
+
   } else {
- 
+
     tryCatch(print(p1), error = function(e) {
       message("Skipping inline preview of p1 (display area too small): ", conditionMessage(e))
     })
- 
-    ggsave(file.path(out_dir, "p1_percenteffect_quadrant.png"), p1, width = 10, height = 7, dpi = 300)
-    ggsave(paste0(image_Save_Location, "SecondaryMarker_quadrant.pdf"), p1, width = 10, height = 7, dpi = 300)
- 
+
+    save_plot(p1, file.path(out_dir, "p1_percenteffect_quadrant.png"), 10, 7)
+    save_plot(p1, paste0(image_Save_Location, "SecondaryMarker_quadrant.pdf"), 10, 7)
+
     merged_df$residual <- NA_real_
   }
- 
+
   # residual_rescue flag for the Excel sheet (TRUE only for viable residual-rescued wells)
   merged_df <- merged_df %>% mutate(residual_rescue = !is.na(residual))
- 
+
   # --- Aux workbook ---
   wb_res <- createWorkbook()
- 
+
   addWorksheet(wb_res, "All Wells")
   writeData(wb_res, "All Wells", secondary_marker_Df %>% arrange(desc(PercentEffect)))
- 
+
+  # "Confirmed Hits" and "Export Hits" were identical filters computed twice --
+  # compute once and write to both sheet names. If these are meant to diverge
+  # later (different audiences), split this back out.
+  confirmed_export_df <- secondary_marker_Df %>%
+    filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")) %>%
+    filter(Viability >= -50) %>%
+    arrange(desc(PercentEffect))
+
   addWorksheet(wb_res, "Confirmed Hits")
-  writeData(wb_res, "Confirmed Hits",
-            secondary_marker_Df %>%
-              filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")) %>%
-              filter(Viability >= -50) %>%
-              arrange(desc(PercentEffect)))
- 
+  writeData(wb_res, "Confirmed Hits", confirmed_export_df)
+
   addWorksheet(wb_res, "Residual Rescued")
   writeData(wb_res, "Residual Rescued",
             suspects %>% filter(residual_hit, Viability >= -50) %>% arrange(desc(residual)))
- 
+
   addWorksheet(wb_res, "Suspects")
   writeData(wb_res, "Suspects", suspects %>% arrange(desc(residual)))
- 
+
   addWorksheet(wb_res, "Export Hits")
-  writeData(wb_res, "Export Hits",
-            secondary_marker_Df %>%
-              filter(hit_class_final %in% c("Confirmed hit", "Residual-rescued")) %>%
-              filter(Viability >= -50) %>%
-              arrange(desc(PercentEffect)))
- 
+  writeData(wb_res, "Export Hits", confirmed_export_df)
+
   addWorksheet(wb_res, "Low Viability Toxic")
   writeData(wb_res, "Low Viability Toxic",
             secondary_marker_Df %>% filter(Viability < -50) %>% arrange(desc(PercentEffect)))
- 
+
   saveWorkbook(wb_res, file.path(out_dir, "residual_analysis.xlsx"), overwrite = TRUE)
- 
+
   cat("secondary marker quadrant/residual analysis complete. Aux outputs in:", out_dir, "\n")
- 
-  # --- Re-write Combined Analysis + Hits with residual + residual_rescue ---
-  if (exists("export_File") && file.exists(export_File)) {
-    wb_x <- loadWorkbook(export_File)
-    md_x <- merged_df %>%
-      mutate(across(where(is.factor), as.character)) %>%
-      arrange(desc(.data[[score_col]]))
-    hd_x <- filter(md_x, .data[[score_col]] >= 3)
-    for (s in c("Combined Analysis", "Hits")) if (s %in% names(wb_x)) removeWorksheet(wb_x, s)
-    addWorksheet(wb_x, "Combined Analysis"); writeData(wb_x, "Combined Analysis", md_x)
-    freezePane(wb_x, "Combined Analysis", firstActiveRow = 2)
-    addFilter(wb_x, "Combined Analysis", rows = 1, cols = 1:ncol(md_x))
-    addWorksheet(wb_x, "Hits"); writeData(wb_x, "Hits", hd_x)
-    freezePane(wb_x, "Hits", firstActiveRow = 2)
-    addFilter(wb_x, "Hits", rows = 1, cols = 1:ncol(hd_x))
-    saveWorkbook(wb_x, export_File, overwrite = TRUE)
-  }
 }
- 
-score_col <- if ("BZScore" %in% names(merged_df)) "BZScore" else "ZScore"
- 
+
+# ---------------------------------------------------------------------------
+# bz_hit / secondary_marker_ok / viab_ok must be computed after the
+# secondary-marker block above (residual_rescue may not exist otherwise), so the
+# export_File write for all three summary sheets happens once, down here.
+# `score_col` itself was already resolved once, robustly, at the top of this file --
+# not re-resolved here, so there's no chance of it disagreeing with score_col_hc above.
+# ---------------------------------------------------------------------------
+
+has_residual_col <- "residual" %in% names(merged_df)
+
 merged_df <- merged_df %>%
   mutate(
     score_value = .data[[score_col]],
     bz_hit  = score_value >= 3,
-    secondary_marker_ok   = if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(.)) {
+    secondary_marker_ok = if (has_secondary_marker && "SecondaryMarker_Intensity_Diff" %in% names(.)) {
                 # passes if secondary marker drop is acceptable OR was flagged by residual method.
-                # `residual` only exists when the residual-rescue step produced hits, so
-                # guard on its presence (otherwise it's all-NA and gets dropped on export).
-                if ("residual" %in% names(.)) {
-                  (SecondaryMarker_Diff >= -25) | (!is.na(residual))
-                } else {
-                  SecondaryMarker_Diff >= -25
-                }
+                (SecondaryMarker_Intensity_Diff >= -25) | (has_residual_col & !is.na(residual))
               } else {
                 TRUE  # no secondary marker data or not applicable — don't penalize
               },
-    viab_ok = if ("Viability" %in% names(.))
-                Viability >= -25
-              else TRUE
+    viab_ok = if ("Viability" %in% names(.)) Viability >= -25 else TRUE
   ) %>%
   select(-score_value)
- 
-# --- Export Hits sheet: BZ/Z >= 3 AND passes viability AND (secondary marker OK or residual-rescued) ---
+
+# --- Single export_File write: Combined Analysis + Hits + Export Hits ---
 if (exists("export_File") && file.exists(export_File)) {
-  export_hits_df <- merged_df %>%
+  wb_x <- loadWorkbook(export_File)
+  md_x <- merged_df %>%
+    mutate(across(where(is.factor), as.character)) %>%
+    arrange(desc(.data[[score_col]]))
+  hd_x <- filter(md_x, .data[[score_col]] >= 3)
+  eh_x <- merged_df %>%
     filter(bz_hit, viab_ok, secondary_marker_ok) %>%
     mutate(across(where(is.factor), as.character)) %>%
     arrange(desc(.data[[score_col]]))
- 
-  wb_eh <- loadWorkbook(export_File)
-  if ("Export Hits" %in% names(wb_eh)) removeWorksheet(wb_eh, "Export Hits")
-  addWorksheet(wb_eh, "Export Hits")
-  writeData(wb_eh, "Export Hits", export_hits_df, startCol = 1, startRow = 1, colNames = TRUE)
-  freezePane(wb_eh, "Export Hits", firstActiveRow = 2)
-  addFilter(wb_eh, "Export Hits", rows = 1, cols = 1:ncol(export_hits_df))
-  saveWorkbook(wb_eh, export_File, overwrite = TRUE)
- 
-  cat("Export Hits sheet written:", nrow(export_hits_df), "hits passing BZ/Z >= 3, viability, and secondary marker/residual-rescue criteria\n")
+
+  sheets <- list("Combined Analysis" = md_x, "Hits" = hd_x, "Export Hits" = eh_x)
+  for (nm in names(sheets)) {
+    if (nm %in% names(wb_x)) removeWorksheet(wb_x, nm)
+    addWorksheet(wb_x, nm)
+    writeData(wb_x, nm, sheets[[nm]])
+    freezePane(wb_x, nm, firstActiveRow = 2)
+    addFilter(wb_x, nm, rows = 1, cols = 1:ncol(sheets[[nm]]))
+  }
+  saveWorkbook(wb_x, export_File, overwrite = TRUE)
+
+  cat("Export Hits sheet written:", nrow(eh_x), "hits passing BZ/Z >= 3, viability, and secondary marker/residual-rescue criteria\n")
 }
- 
- plot_normalized_score <- function(df, image_path, has_secondary_marker = TRUE) {
+
+plot_normalized_score <- function(df, image_path, has_secondary_marker = TRUE) {
   # score_col/label_y come from the GUI's score-type toggle (scoreType/useBZ,
   # set once near the top of the pipeline) -- independent of signal ON/OFF.
-  label_y   <- if (useBZ) "BZ-Score" else "Z-Score"
-  y_limits  <- c(min(merged_df[[score_col]], na.rm = TRUE), max(merged_df[[score_col]], na.rm = TRUE))
-  y_breaks  <- c(-4, -2, 0, 2, 4, 6, 8)
- 
+  label_y <- if (useBZ) "BZ-Score" else "Z-Score"
+
+  # --- Guard against the empty-plot failure mode ---
+  # If score_col is entirely NA (e.g. BZScore never populated for this run) or
+  # contains Inf/-Inf (zero-variance plate in the MAD/SD normalization step),
+  # both the >=3 and <3 filters below can silently return zero rows, or the
+  # y-axis range becomes non-finite -- either way you get axes with nothing
+  # plotted and no error. Drop non-finite scores up front and warn loudly
+  # instead of failing silently.
+  n_total       <- nrow(df)
+  n_nonfinite   <- sum(!is.finite(df[[score_col]]))
+  if (n_nonfinite > 0) {
+    warning(n_nonfinite, " of ", n_total, " wells have non-finite ", score_col,
+            " (NA/Inf) and are being dropped from the normalized score plot.")
+  }
+  df <- df %>% filter(is.finite(.data[[score_col]]))
+
+  if (nrow(df) == 0) {
+    stop("plot_normalized_score(): no wells have a finite ", score_col,
+         " value -- check upstream normalization before plotting.")
+  }
+
+  y_limits <- c(min(df[[score_col]], na.rm = TRUE), max(df[[score_col]], na.rm = TRUE))
+  y_breaks <- c(-4, -2, 0, 2, 4, 6, 8)
+
   hits_df <- dplyr::filter(df, .data[[score_col]] >= 3)
   bg_df   <- dplyr::filter(df, .data[[score_col]] < 3)
- 
+
   if (has_secondary_marker) {
     hits_df <- hits_df %>% mutate(pass = as.character(secondary_marker_ok & viab_ok))
   } else {
@@ -1898,13 +1940,13 @@ if (exists("export_File") && file.exists(export_File)) {
     # still matters, so a hit only passes if it clears the viability bar.
     hits_df <- hits_df %>% mutate(pass = as.character(viab_ok))
   }
- 
+
   p <- ggplot(df, aes(x = paste0(Well, Plate), y = .data[[score_col]])) +
     geom_point(
       data     = bg_df,
       color    = "gray70",
       size     = 0.5,
-      alpha    = 0.3,
+      alpha    = 0.375,  # 25% darker than the previous 0.3
       position = position_jitter(width = 0.3, height = 0)
     ) +
     geom_point(
@@ -1912,12 +1954,18 @@ if (exists("export_File") && file.exists(export_File)) {
       aes(color = pass, size = pass),
       alpha = 1
     ) +
-    # Only label the strongest red hits (BZ/Z > 4) to avoid an unreadable wall of text
-    
+    geom_text_repel(
+      data = hits_df,
+      aes(label = Reference),
+      size = 3,
+      max.overlaps = Inf,
+      box.padding = 0.3,
+      point.padding = 0.2,
+      show.legend = FALSE
+    ) +
     scale_color_manual(values = c("TRUE" = "black", "FALSE" = "black")) +
     scale_size_manual(values  = c("TRUE" = 1.6,   "FALSE" = 1.2)) +
     geom_hline(yintercept = 2, linetype = "dashed", linewidth = 1.5) +
-   
     scale_y_continuous(limits = y_limits, breaks = y_breaks) +
     coord_cartesian(ylim = y_limits) +
     theme_classic() +
@@ -1930,7 +1978,7 @@ if (exists("export_File") && file.exists(export_File)) {
     ) +
     labs(x = "Compound", y = label_y) +
     guides(color = "none", size = "none")
- 
+
   ggsave(
     filename = paste0(image_path, "normalized_SigScoreSecondaryMarkerScreen.pdf"),
     plot     = p,
@@ -1938,13 +1986,15 @@ if (exists("export_File") && file.exists(export_File)) {
     width    = 8,
     height   = 8
   )
- 
+
   return(p)
 }
-plot_normalized_score(merged_df, image_Save_Location, has_secondary_marker = has_secondary_marker) 
- 
- 
+plot_normalized_score(merged_df, image_Save_Location, has_secondary_marker = has_secondary_marker)
+
+
 merged_df
+
+
 ```
  
  
@@ -1970,11 +2020,10 @@ merged_df
 ggsave(paste(image_Save_Location, "RawFociDistribution.pdf", sep = ""),
         raw_distribution,
         dpi = 300,
-        width = 10,
-        height = 10)
+        width = 12,
+        height = 12)
  
-print(raw_distribution)
- 
+
  
 #NORMALIZED EFFECT DISTRIBUTION
   normalized_dist <- ggplot(merged_df, aes(x = PercentEffect)) +
@@ -2023,11 +2072,10 @@ normalized_dist <- normalized_dist +
   ggsave(paste(image_Save_Location, "NormalizedEffectDistribution.pdf", sep = ""),
         normalized_dist,
         dpi = 300,
-        width = 10,
-        height = 10)
+        width = 12,
+        height = 12)
  
-print(normalized_dist)
- 
+
 # ── NEW DYNAMIC DISTRIBUTIONS (per condition / well) ─────────────────────────
 # Each plot is drawn only if its column exists in merged_df and has data, so a
 # missing optional channel is silently skipped instead of erroring. merged_df is
@@ -2049,7 +2097,7 @@ if ("CytoFoci_Count" %in% names(merged_df) && any(!is.na(merged_df$CytoFoci_Coun
     labs(title = NULL, y = "Count (conditions)", x = "Cytoplasmic GFP Foci / Cell") +
     .distr_theme
   ggsave(paste(image_Save_Location, "CytoFociCount_distribution.pdf", sep = ""),
-         cyto_foci_dist, dpi = 300, width = 10, height = 10)
+         cyto_foci_dist, dpi = 300, width = 12, height = 12)
   print(cyto_foci_dist)
 } else {
   message("Skipping cytoplasmic-foci-count distribution: column absent or all-NA.")
@@ -2063,17 +2111,17 @@ if ("NucFoci_IntegratedIntensity" %in% names(merged_df) && any(!is.na(merged_df$
     labs(title = NULL, y = "Count (conditions)", x = "Nuclear GFP Foci Integrated Intensity") +
     .distr_theme
   ggsave(paste(image_Save_Location, "NucFociIntInt_distribution.pdf", sep = ""),
-         nuc_foci_int_dist, dpi = 300, width = 10, height = 10)
-  print(nuc_foci_int_dist)
+         nuc_foci_int_dist, dpi = 300, width = 12, height = 12)
+   
 } else {
   message("Skipping nuclear-foci integrated-intensity distribution: column absent or all-NA.")
 }
  
 # (3) secondary marker normalized effect distribution (only if a secondary marker channel exists)
-if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df) && any(!is.na(merged_df$SecondaryMarker_Diff))) {
+if (has_secondary_marker && "SecondaryMarker_Intensity_Diff" %in% names(merged_df) && any(!is.na(merged_df$SecondaryMarker_Intensity_Diff))) {
   secondary_marker_dist_df <- merged_df %>%
-    filter(!is.na(SecondaryMarker_Diff)) %>%
-    mutate(TotalPercentSecondaryMarker = 100 + SecondaryMarker_Diff)
+    filter(!is.na(SecondaryMarker_Intensity_Diff)) %>%
+    mutate(TotalPercentSecondaryMarker = 100 + SecondaryMarker_Intensity_Diff)
  
   SecondaryMarker_dist <- ggplot(secondary_marker_dist_df, aes(x = TotalPercentSecondaryMarker)) +
     geom_histogram(color = "black", fill = "darkgray", binwidth = 4) +
@@ -2083,8 +2131,8 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df) && any(
     .distr_theme
  
   ggsave(paste(image_Save_Location, "SecondaryMarker_NormalizedEffect_distribution.pdf", sep = ""),
-         SecondaryMarker_dist, dpi = 300, width = 10, height = 10)
-  print(SecondaryMarker_dist)
+         SecondaryMarker_dist, dpi = 300, width = 12, height = 12)
+   
 } else {
   message("Skipping secondary marker normalized-effect distribution: no secondary marker channel.")
 }
@@ -2107,7 +2155,6 @@ if (has_secondary_marker && "SecondaryMarker_Diff" %in% names(merged_df) && any(
 #If not previously defined:
 #fileX   <- paste0(project_data_dir, "CondenScreenV2.xlsx")
  
-file_Location    <- project_data_dir
 fileX            <- paste0(file_Location, "CondenScreenV2.xlsx")
 sheetX           <- "Combined Analysis"
 out_dir          <- paste0(file_Location, "HTS_QC_OUT/")
@@ -2421,6 +2468,7 @@ write_df("plate_col_stats",     plate_col_stats)
  
 saveWorkbook(wb, file.path(out_dir,"HTS_QC_RESULTS.xlsx"), overwrite=TRUE)
 invisible(NULL)
+ 
  
  
 ```
@@ -2995,8 +3043,8 @@ df_final <- df_hits %>%
   select(-ends_with(".old")) %>%
   mutate(
     Viability = if ("Viability" %in% names(.)) Viability else NA_real_,
-    SecondaryMarker = if ("SecondaryMarker_Diff" %in% names(.)) {
-    SecondaryMarker_Diff <= -25 &
+    SecondaryMarker = if ("SecondaryMarker_Intensity_Diff" %in% names(.)) {
+    SecondaryMarker_Intensity_Diff <= -25 &
       if ("residual" %in% names(.)) is.na(residual) else TRUE
   } else FALSE,
     
@@ -3052,7 +3100,7 @@ df_final <- df_final %>%
     "BZScore", "ZScore", "BScore", "PercentEffect",
     "Viability", "Risk", "PlateZPrimeScore", "Systematic_error", "QC_alpha",
     "AvgFoci", "Average_foci_perCell", "CellCount", "CellCountPercentDiff",
-    "AssayType", "SecondaryMarker", "residual", "Cytotoxic",
+    "AssayType", "SecondaryMarker_Intensity", "residual", "Cytotoxic",
     "CAS", "SMILES_used", "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
     "AlertScore", "alert_flags"
   )))
@@ -3126,7 +3174,7 @@ df_chem <- df_final %>%
   filter(
     .data[[score_col_chem]] > 3,
     is.na(Viability) | Viability >= -50,
-    if (has_secondary_marker && "SecondaryMarker" %in% names(.)) (is.na(SecondaryMarker) | !SecondaryMarker) else TRUE
+    if (has_secondary_marker && "SecondaryMarker_Intensity" %in% names(.)) (is.na(SecondaryMarker_Intensity) | !SecondaryMarker_Intensity) else TRUE
   )
  
 message("Cheminformatics: ", nrow(df_chem), " of ", nrow(df_final),
@@ -3160,7 +3208,7 @@ umap_colors <- c("NT Ctrl" = "#F4A8B0", "RNF26" = "#F5C89A", "ZNF335" = "#C8B8E0
 make_legend <- function(ref, hits_df) {
   row <- hits_df %>% filter(Reference == ref)
   paste0(ref, " | Effect:", sprintf("%.1f", row$PercentEffect),
-         " | td:", sprintf("%.1f", row$SecondaryMarker_Diff))
+         " | td:", sprintf("%.1f", row$SecondaryMarker_Intensity_Diff))
 }
 strip_name <- function(mol) { mol$SetProp("_Name", ""); mol }
  
@@ -3435,7 +3483,7 @@ if (length(groups_unique) == 0) {
       row <- df_merged %>% filter(Reference == ref) %>% slice(1)
  
       eff_val <- if ("PercentEffect" %in% names(row)) row$PercentEffect[1] else NA_real_
-      secondary_marker_val  <- if ("SecondaryMarker_Diff" %in% names(row)) row$SecondaryMarker_Diff[1] else NA_real_
+      secondary_marker_val  <- if ("SecondaryMarker_Intensity_Diff" %in% names(row)) row$SecondaryMarker_Intensity_Diff[1] else NA_real_
  
       others    <- setdiff(seq_len(n_in_grp), i)
       tan_lines <- sapply(others, function(j) {
@@ -3542,7 +3590,7 @@ freezePane(wb, "UMAP Results", firstRow = TRUE, firstCol = FALSE)
 #     column applies for this run).
 addWorksheet(wb, "Clusters")
 cluster_export <- cluster_all_df %>%
-  left_join(df_merged %>% select(any_of(c("Reference", "PercentEffect", "SecondaryMarker_Diff"))), by = "Reference") %>%
+  left_join(df_merged %>% select(any_of(c("Reference", "PercentEffect", "SecondaryMarker_Intensity_Diff"))), by = "Reference") %>%
   left_join(df_chem %>% select(Reference, Score = all_of(score_col_chem)), by = "Reference") %>%
   group_by(Group) %>%
   mutate(Hit = Score > 3) %>%
@@ -3555,8 +3603,8 @@ n_cluster_rows  <- nrow(cluster_export)
 n_cluster_cols  <- ncol(cluster_export)
 cluster_colnames <- names(cluster_export)
  
-# Numeric columns vary depending on whether SecondaryMarker_Diff exists for this run
-numeric_cols <- match(intersect(c("PercentEffect", "SecondaryMarker_Diff", "Score"), cluster_colnames),
+# Numeric columns vary depending on whether SecondaryMarker_Intensity_Diff exists for this run
+numeric_cols <- match(intersect(c("PercentEffect", "SecondaryMarker_Intensity_Diff", "Score"), cluster_colnames),
                        cluster_colnames)
  
 addStyle(wb, "Clusters", style = cell_style_text,
@@ -3634,7 +3682,7 @@ if (exists("export_hits_df") && exists("fileX") && file.exists(fileX)) {
       mutate(across(where(is.factor), as.character)) %>%
       select(any_of(c("Plate", "Well", "Risk", "AlertScore", "alert_flags",
                        "MW", "LogP", "HBD", "HBA", "Lipinski", "Lipinski_Failed",
-                       "CAS", "SMILES_used", "SecondaryMarker", "Cytotoxic"))) %>%
+                       "CAS", "SMILES_used", "SecondaryMarker_Intensity", "Cytotoxic"))) %>%
       distinct(Plate, Well, .keep_all = TRUE)
   } else {
     tibble::tibble(Plate = character(), Well = character())

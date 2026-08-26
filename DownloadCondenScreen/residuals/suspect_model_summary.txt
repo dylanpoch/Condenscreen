@@ -1,0 +1,78 @@
+=== Suspect Cluster Regression Model ===
+
+Formula: PercentEffect ~ TotalPercentSecondaryMarker
+Subset: hit_class == 'Suspect — co-suppressed'
+
+$call
+lm(formula = PercentEffect ~ TotalPercentSecondaryMarker, data = suspects)
+
+$terms
+PercentEffect ~ TotalPercentSecondaryMarker
+attr(,"variables")
+list(PercentEffect, TotalPercentSecondaryMarker)
+attr(,"factors")
+                            TotalPercentSecondaryMarker
+PercentEffect                                         0
+TotalPercentSecondaryMarker                           1
+attr(,"term.labels")
+[1] "TotalPercentSecondaryMarker"
+attr(,"order")
+[1] 1
+attr(,"intercept")
+[1] 1
+attr(,"response")
+[1] 1
+attr(,".Environment")
+<environment: R_GlobalEnv>
+attr(,"predvars")
+list(PercentEffect, TotalPercentSecondaryMarker)
+attr(,"dataClasses")
+              PercentEffect TotalPercentSecondaryMarker 
+                  "numeric"                   "numeric" 
+
+$residuals
+         1          2          3          4 
+-0.8628076 -2.6859258  4.8672792 -1.3185457 
+
+$coefficients
+                              Estimate Std. Error   t value   Pr(>|t|)
+(Intercept)                 105.590715 22.9313545  4.604644 0.04406941
+TotalPercentSecondaryMarker  -0.738397  0.4948581 -1.492139 0.27419503
+
+$aliased
+                (Intercept) TotalPercentSecondaryMarker 
+                      FALSE                       FALSE 
+
+$sigma
+[1] 4.085805
+
+$df
+[1] 2 2 2
+
+$r.squared
+[1] 0.5267929
+
+$adj.r.squared
+[1] 0.2901893
+
+$fstatistic
+   value    numdf    dendf 
+2.226479 1.000000 2.000000 
+
+$cov.unscaled
+                            (Intercept) TotalPercentSecondaryMarker
+(Intercept)                  31.4995365                 -0.67705636
+TotalPercentSecondaryMarker  -0.6770564                  0.01466919
+
+attr(,"class")
+[1] "summary.lm"
+
+=== Model Performance ===
+R-squared:          0.527 
+Adjusted R-squared: 0.29 
+Residual Std Error: 4.086 
+
+=== Residual Rescue Rule ===
+Method: residual >= 20 AND Viability >= -50
+Rescued hits: 0 
+Total suspects: 4 
