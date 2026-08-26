@@ -78,6 +78,14 @@ results/
 *.csv
 *.xlsx
 
+#Images:
+*.png
+*.PNG
+*.jpg
+*.JPG
+*.TIFF
+*.TIF
+
 # CellProfiler (optional, if you have large pipeline outputs)
 # Adjust if these are needed for reproducibility
 *.h5
